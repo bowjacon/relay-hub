@@ -108,7 +108,7 @@ start_service() {
   echo $! > .relay-hub.pid
   local pid="$(cat .relay-hub.pid)" started=$SECONDS elapsed
   while kill -0 "$pid" 2>/dev/null; do
-    if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+    if curl --noproxy '*' -fsS --max-time 2 "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
       progress "服务已就绪：http://127.0.0.1:${PORT}（耗时 $((SECONDS - started))s）"
       return 0
     fi
@@ -116,6 +116,7 @@ start_service() {
     if [ "$elapsed" -ge "$DEPLOY_TIMEOUT_START" ]; then
       progress "服务启动超时（${elapsed}s），最近日志："
       tail -n 30 logs/console.log >&2 || true
+      stop_tree "$pid"
       return 124
     fi
     progress "等待服务启动（已用 ${elapsed}s/${DEPLOY_TIMEOUT_START}s）"
