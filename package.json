@@ -1,0 +1,21 @@
+{
+  "name": "relay-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "API relay aggregation control plane for AI agent CLIs",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "files": [
+    "server.js",
+    "public",
+    "README.md",
+    "AGENTS.md",
+    ".env.example"
+  ],
+  "dependencies": {
+    "undici": "^6.28.1"
+  }
+}

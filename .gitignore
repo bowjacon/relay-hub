@@ -1,0 +1,12 @@
+node_modules/
+logs/
+data/
+.env
+.env.*
+!.env.example
+*.local.json
+relay-hub-config*.json
+config-export*.json
+.relay-hub.pid
+.DS_Store
+npm-debug.log*
