@@ -43,6 +43,14 @@ curl -fsSL https://raw.githubusercontent.com/bowjacon/relay-hub/main/deploy.sh |
 
 脚本要求 Node.js 18+、npm 和 Git；它会执行 `npm install --omit=dev` 并后台启动服务。网页打开 `http://服务器地址:4173`。首次启动后在网页中添加来源、配置当前服务器代理，再按需导入配置文件。仓库忽略 `data/`、`logs/`、`.env` 和 `relay-hub-config*.json`，不要把含凭据导出文件提交到 Git。
 
+部署脚本会实时显示 Git 拉取、npm 安装、停止旧服务和启动检查的进度，并为各阶段设置超时：Git 默认 180 秒、npm 默认 300 秒、停止服务和启动服务默认 30 秒。可按服务器情况覆盖，例如：
+
+```bash
+DEPLOY_TIMEOUT_GIT=300 DEPLOY_TIMEOUT_NPM=600 RELAY_HUB_RESTART=1 bash deploy.sh
+```
+
+超过超时后脚本会终止当前阶段并输出 `logs/console.log` 最近 30 行。脚本默认禁止 Git 凭据交互、npm 依赖重试一次并关闭 audit/fund；需要代理下载时，先设置 `http_proxy` 和 `https_proxy`。
+
 设置页的“检查更新”会比较 GitHub `main` 分支；通过本脚本启动的服务点击“立即升级”后会自动拉取、安装依赖并重启，同时保留 `data/relay-hub-state.json` 中的 API 来源、来源 Key、Agent Key、路由和状态。命令行更新可执行：
 
 ```bash
