@@ -874,6 +874,19 @@ const normalizeOpenAIResponse = (text, protocol, model) => {
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.choices) || !payload.choices[0]?.message) throw new Error('上游返回格式不兼容，缺少 choices.message');
   return fromOpenAIResponse(payload, protocol, model);
 };
+const writeAnthropicStream = (res, message) => {
+  const text = message.content?.[0]?.text || '';
+  const inputTokens = Number(message.usage?.input_tokens || 0);
+  const outputTokens = Number(message.usage?.output_tokens || 0);
+  const writeEvent = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  writeEvent('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, stop_sequence: null } });
+  writeEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  if (text) writeEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
+  writeEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason || 'end_turn', stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+  writeEvent('message_stop', { type: 'message_stop' });
+  res.end();
+};
 
 const handler = async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
@@ -1233,17 +1246,22 @@ const handler = async (req, res) => {
         const targetPath = targetProtocol === 'anthropic' ? '/messages' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
+        if (targetProtocol === 'openai' && protocol === 'anthropic' && body.stream) upstreamBody.stream = false;
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         const text = await upstream.text();
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
         if (upstream.ok || candidate === candidates.at(-1)) {
-          if (!upstream.ok || targetProtocol !== 'openai' || body.stream) {
+          if (!upstream.ok || targetProtocol !== 'openai') {
             res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' });
             return res.end(text);
           }
           try {
             const normalizedResponse = normalizeOpenAIResponse(text, protocol, candidateModel);
+            if (body.stream && protocol === 'anthropic') {
+              res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+              return writeAnthropicStream(res, normalizedResponse);
+            }
             res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
             return res.end(JSON.stringify(normalizedResponse));
           } catch (error) {
