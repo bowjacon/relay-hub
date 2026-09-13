@@ -10,6 +10,7 @@ if [ -f "$APP_DIR/.env" ]; then
   . "$APP_DIR/.env"
   set +a
 fi
+PORT="${PORT:-4173}"
 
 if ! command -v git >/dev/null 2>&1; then
   echo "需要先安装 Git" >&2
@@ -49,23 +50,46 @@ start_service() {
   fi
 }
 
+stop_tree() {
+  local pid="$1"
+  case "$pid" in
+    ''|*[!0-9]*) return ;;
+  esac
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    stop_tree "$child"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+stop_service() {
+  if [ -f .relay-hub.pid ]; then
+    stop_tree "$(cat .relay-hub.pid)"
+  fi
+  for pid in $(fuser -n tcp "$PORT" 2>/dev/null || true); do
+    stop_tree "$pid"
+  done
+  sleep 1
+  for pid in $(fuser -n tcp "$PORT" 2>/dev/null || true); do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+}
+
 if [ -f .relay-hub.pid ] && kill -0 "$(cat .relay-hub.pid)" 2>/dev/null; then
   if [ "${RELAY_HUB_RESTART:-0}" = "1" ]; then
-    old_pid="$(cat .relay-hub.pid)"
-    kill "$old_pid" 2>/dev/null || true
-    pkill -TERM -P "$old_pid" 2>/dev/null || true
-    sleep 1
+    stop_service
     start_service
     echo "Relay Hub 已重启，PID $(cat .relay-hub.pid)"
   else
     echo "Relay Hub 已在运行，PID $(cat .relay-hub.pid)"
   fi
 else
+  if [ "${RELAY_HUB_RESTART:-0}" = "1" ] && [ -n "$(fuser -n tcp "$PORT" 2>/dev/null || true)" ]; then
+    stop_service
+  fi
   start_service
   echo "Relay Hub 已启动，PID $(cat .relay-hub.pid)"
 fi
 
-PORT="${PORT:-4173}"
 echo "Relay Hub 已部署：http://127.0.0.1:${PORT}"
 echo "数据目录：$APP_DIR/data"
 echo "日志目录：$APP_DIR/logs"
