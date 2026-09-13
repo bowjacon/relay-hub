@@ -4,6 +4,13 @@ set -Eeuo pipefail
 REPO_URL="${REPO_URL:-https://github.com/bowjacon/relay-hub.git}"
 APP_DIR="${APP_DIR:-$HOME/relay-hub}"
 
+if [ -f "$APP_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$APP_DIR/.env"
+  set +a
+fi
+
 if ! command -v git >/dev/null 2>&1; then
   echo "需要先安装 Git" >&2
   exit 1
