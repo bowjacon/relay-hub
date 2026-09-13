@@ -32,16 +32,30 @@ set -a
 . ./.env
 set +a
 
-if [ -f .relay-hub.pid ] && kill -0 "$(cat .relay-hub.pid)" 2>/dev/null; then
-  echo "Relay Hub 已在运行，PID $(cat .relay-hub.pid)"
-else
-  nohup npm start > logs/console.log 2>&1 &
+start_service() {
+  nohup bash -c 'while true; do RELAY_HUB_SUPERVISED=1 npm start; code=$?; if [ "$code" -ne 75 ]; then exit "$code"; fi; sleep 1; done' > logs/console.log 2>&1 &
   echo $! > .relay-hub.pid
   sleep 1
   if ! kill -0 "$(cat .relay-hub.pid)" 2>/dev/null; then
     echo "Relay Hub 启动失败，请查看 $APP_DIR/logs/console.log" >&2
     exit 1
   fi
+}
+
+if [ -f .relay-hub.pid ] && kill -0 "$(cat .relay-hub.pid)" 2>/dev/null; then
+  if [ "${RELAY_HUB_RESTART:-0}" = "1" ]; then
+    old_pid="$(cat .relay-hub.pid)"
+    kill "$old_pid" 2>/dev/null || true
+    pkill -TERM -P "$old_pid" 2>/dev/null || true
+    sleep 1
+    start_service
+    echo "Relay Hub 已重启，PID $(cat .relay-hub.pid)"
+  else
+    echo "Relay Hub 已在运行，PID $(cat .relay-hub.pid)"
+  fi
+else
+  start_service
+  echo "Relay Hub 已启动，PID $(cat .relay-hub.pid)"
 fi
 
 PORT="${PORT:-4173}"

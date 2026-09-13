@@ -1,18 +1,24 @@
 import http from 'node:http';
+import { execFile as execFileCallback } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { appendFile, chmod, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { ProxyAgent } from 'undici';
 
-const root = fileURLToPath(new URL('.', import.meta.url));
+const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const publicDir = join(root, 'public');
+const execFile = promisify(execFileCallback);
 
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const configuredLogLevel = String(process.env.LOG_LEVEL || 'info').toLowerCase();
 const logLevel = Object.hasOwn(LOG_LEVELS, configuredLogLevel) ? configuredLogLevel : 'info';
 const logDirectory = resolve(root, process.env.LOG_DIR || 'logs');
 const persistentStateFile = resolve(root, process.env.STATE_FILE || 'data/relay-hub-state.json');
+const updateRepository = String(process.env.REPO_URL || 'https://github.com/bowjacon/relay-hub.git');
+const updateBranch = String(process.env.REPO_BRANCH || 'main');
+const updateCommandTimeout = 180000;
 const logMaxBytes = Math.max(1024 * 1024, Number(process.env.LOG_MAX_SIZE_MB || 20) * 1024 * 1024);
 const logMaxFiles = Math.max(2, Number(process.env.LOG_MAX_FILES || 10));
 const logRetentionDays = Math.max(1, Number(process.env.LOG_RETENTION_DAYS || 14));
@@ -20,6 +26,7 @@ const proxyAgents = new Map();
 const logQueues = new Map();
 const runtimeLogMemory = new Map();
 let statePersistQueue = Promise.resolve();
+let updateOperation = null;
 
 const environmentProxyUrl = () => process.env.http_proxy || process.env.HTTP_PROXY || '';
 const proxyUrl = () => {
@@ -210,6 +217,75 @@ const persistState = () => {
     await chmod(persistentStateFile, 0o600);
   }).catch((error) => console.error(`[relay-hub] cannot persist state: ${error.message}`));
   return statePersistQueue;
+};
+
+const runUpdateCommand = async (command, args, timeout = updateCommandTimeout) => {
+  const result = await execFile(command, args, { cwd: root, timeout, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
+  return String(result.stdout || '').trim();
+};
+const safeRepositoryUrl = (value) => {
+  try {
+    const parsed = new URL(value);
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return '[configured repository]';
+  }
+};
+const stateIdentity = (payload) => JSON.stringify({
+  sources: (payload?.sources || []).map((source) => ({ id: source.id, apiKey: source.apiKey, models: source.models, proxyEnabled: source.proxyEnabled })).sort((a, b) => a.id.localeCompare(b.id)),
+  agents: (payload?.agents || []).map((agent) => ({ id: agent.id, relayApiKey: agent.relayApiKey, sourceId: agent.sourceId, model: agent.model })).sort((a, b) => a.id.localeCompare(b.id)),
+});
+const readPersistedState = async () => JSON.parse(await readFile(persistentStateFile, 'utf8'));
+const getUpdateStatus = async () => {
+  try {
+    const isWorkTree = await runUpdateCommand('git', ['rev-parse', '--is-inside-work-tree'], 15000);
+    if (isWorkTree !== 'true') throw new Error('当前部署不是 Git 工作目录');
+    const repositoryRoot = resolve(await runUpdateCommand('git', ['rev-parse', '--show-toplevel'], 15000));
+    if (repositoryRoot !== root) throw new Error('Git 工作目录与当前服务目录不一致');
+    const remote = await runUpdateCommand('git', ['remote', 'get-url', 'origin'], 15000).catch(() => updateRepository);
+    const branch = await runUpdateCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], 15000);
+    const currentCommit = await runUpdateCommand('git', ['rev-parse', 'HEAD'], 15000);
+    const currentMessage = await runUpdateCommand('git', ['log', '-1', '--format=%s'], 15000);
+    const dirty = Boolean(await runUpdateCommand('git', ['status', '--porcelain', '--untracked-files=no'], 15000));
+    const remoteLine = await runUpdateCommand('git', ['ls-remote', remote, `refs/heads/${updateBranch}`], 20000);
+    const latestCommit = remoteLine.split(/\s+/)[0] || '';
+    const updateAvailable = Boolean(latestCommit && latestCommit !== currentCommit);
+    const canUpdate = branch === updateBranch && !dirty && Boolean(latestCommit);
+    return { available: true, canUpdate, updateAvailable, currentCommit, currentShortCommit: currentCommit.slice(0, 7), currentMessage, latestCommit, latestShortCommit: latestCommit.slice(0, 7), branch, repository: safeRepositoryUrl(remote), dirty, restartMode: process.env.RELAY_HUB_SUPERVISED === '1' ? 'supervised' : 'manual' };
+  } catch (error) {
+    return { available: false, canUpdate: false, updateAvailable: false, repository: safeRepositoryUrl(updateRepository), reason: safeLogText(error.message), restartMode: process.env.RELAY_HUB_SUPERVISED === '1' ? 'supervised' : 'manual' };
+  }
+};
+const applyUpdate = async () => {
+  if (updateOperation) throw new Error('已有更新任务正在执行');
+  updateOperation = (async () => {
+    const status = await getUpdateStatus();
+    if (!status.available) throw new Error(status.reason || '无法检查远程仓库');
+    if (!status.updateAvailable) return { ...status, updated: false, message: '当前已经是最新版本' };
+    if (!status.canUpdate) throw new Error(status.dirty ? '当前目录有未提交修改，请先处理后再升级' : `当前分支必须是 ${updateBranch}`);
+    await persistState();
+    const backupFile = `${persistentStateFile}.before-update-${process.pid}`;
+    await copyFile(persistentStateFile, backupFile);
+    const beforeIdentity = stateIdentity(await readPersistedState());
+    try {
+      await runUpdateCommand('git', ['pull', '--ff-only', 'origin', updateBranch], 120000);
+      await runUpdateCommand(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['install', '--omit=dev'], 180000);
+      const afterState = await readPersistedState();
+      if (stateIdentity(afterState) !== beforeIdentity) throw new Error('升级后检测到来源或 Agent Key 发生变化，已恢复升级前状态');
+      await unlink(backupFile).catch(() => {});
+      const restartScheduled = process.env.RELAY_HUB_SUPERVISED === '1';
+      if (restartScheduled) setTimeout(() => process.exit(75), 800);
+      return { ...(await getUpdateStatus()), updated: true, restartScheduled, restartRequired: !restartScheduled, preserved: { sources: afterState.sources.length, agents: afterState.agents.length }, message: restartScheduled ? '升级完成，服务即将自动重启，来源和 API Key 已保留' : '升级文件已完成，需手动重启服务，来源和 API Key 已保留' };
+    } catch (error) {
+      await copyFile(backupFile, persistentStateFile).catch(() => {});
+      throw error;
+    } finally {
+      await unlink(backupFile).catch(() => {});
+    }
+  })();
+  try { return await updateOperation; } finally { updateOperation = null; }
 };
 
 const json = (res, status, payload) => {
@@ -741,6 +817,16 @@ const handler = async (req, res) => {
       return json(res, 200, { ok: true, ...result, state: publicState() });
     } catch (error) {
       return json(res, 400, { error: safeLogText(error.message) });
+    }
+  }
+
+  if (pathname === '/api/update/check' && req.method === 'GET') return json(res, 200, await getUpdateStatus());
+  if (pathname === '/api/update/apply' && req.method === 'POST') {
+    try {
+      const result = await applyUpdate();
+      return json(res, 200, result);
+    } catch (error) {
+      return json(res, 409, { error: safeLogText(error.message) });
     }
   }
 

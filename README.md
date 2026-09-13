@@ -40,6 +40,15 @@ curl -fsSL https://raw.githubusercontent.com/bowjacon/relay-hub/main/deploy.sh |
 
 脚本要求 Node.js 18+、npm 和 Git；它会执行 `npm install --omit=dev` 并后台启动服务。网页打开 `http://服务器地址:4173`。首次启动后在网页中添加来源、配置当前服务器代理，再按需导入配置文件。仓库忽略 `data/`、`logs/`、`.env` 和 `relay-hub-config*.json`，不要把含凭据导出文件提交到 Git。
 
+设置页的“检查更新”会比较 GitHub `main` 分支；通过本脚本启动的服务点击“立即升级”后会自动拉取、安装依赖并重启，同时保留 `data/relay-hub-state.json` 中的 API 来源、来源 Key、Agent Key、路由和状态。命令行更新可执行：
+
+```bash
+cd "$HOME/relay-hub"
+RELAY_HUB_RESTART=1 bash deploy.sh
+```
+
+如果服务不是通过 `deploy.sh` 启动，更新接口会只更新文件并提示手动重启；不要删除 `data/` 目录。
+
 ## CLI 接入
 
 把控制台 Agent 路由页生成的专属 API Key 和对应 API 地址填入 CLI。每个 Agent 的 Key 只允许访问自己的协议入口：
@@ -67,6 +76,8 @@ GET  /api/runtime-logs?channel=request|app|error|audit&limit=100
 DELETE /api/runtime-logs
 GET  /api/config/export?includeSecrets=false
 POST /api/config/import
+GET  /api/update/check
+POST /api/update/apply
 ```
 
 `POST /api/models/refresh` 可传 `sourceId` 使用已保存来源的 Key，也可传 `provider`、`apiKey`、`baseUrl` 临时刷新。官方接口不可用时返回最近一次成功缓存或内置目录，不会清空已有模型。
