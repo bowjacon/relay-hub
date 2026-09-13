@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { execFile as execFileCallback } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { appendFile, chmod, copyFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +10,14 @@ import { ProxyAgent } from 'undici';
 const root = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const publicDir = join(root, 'public');
 const execFile = promisify(execFileCallback);
+const scrypt = promisify(scryptCallback);
+
+const SESSION_COOKIE = 'relay_hub_session';
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
+const adminSessions = new Map();
+const loginAttempts = new Map();
 
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
 const configuredLogLevel = String(process.env.LOG_LEVEL || 'info').toLowerCase();
@@ -143,6 +151,54 @@ const AGENT_ENDPOINTS = {
 };
 
 const createRelayApiKey = () => `rh_${randomBytes(24).toString('hex')}`;
+const hashPassword = async (password, salt) => (await scrypt(String(password), salt, 64)).toString('hex');
+const ensureAuthCredentials = async () => {
+  if (state.auth?.username && /^[0-9a-f]{32}$/i.test(state.auth.passwordSalt || '') && /^[0-9a-f]{128}$/i.test(state.auth.passwordHash || '')) return false;
+  const passwordSalt = randomBytes(16).toString('hex');
+  state.auth = { username: 'root', passwordSalt, passwordHash: await hashPassword('admin', passwordSalt), passwordChangedAt: null };
+  return true;
+};
+const verifyAdminPassword = async (password) => {
+  const expected = Buffer.from(state.auth.passwordHash, 'hex');
+  const candidate = Buffer.from(await hashPassword(password, state.auth.passwordSalt), 'hex');
+  return expected.length === candidate.length && timingSafeEqual(expected, candidate);
+};
+const sessionTokenHash = (token) => createHash('sha256').update(token).digest('hex');
+const parseCookies = (header = '') => Object.fromEntries(String(header).split(';').map((part) => {
+  const [rawKey, ...rawValue] = part.trim().split('=');
+  try { return [decodeURIComponent(rawKey || ''), decodeURIComponent(rawValue.join('=') || '')]; } catch { return ['', '']; }
+}).filter(([key]) => key));
+const requestClientIp = (req) => String(process.env.TRUST_PROXY === '1' ? (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') : (req.socket.remoteAddress || '')).split(',')[0].trim() || 'unknown';
+const getAdminSession = (req) => {
+  const token = parseCookies(req.headers.cookie || '')[SESSION_COOKIE];
+  if (!token) return null;
+  const key = sessionTokenHash(token);
+  const session = adminSessions.get(key);
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) { adminSessions.delete(key); return null; }
+  session.expiresAt = Date.now() + SESSION_TTL_MS;
+  return { ...session, key, token };
+};
+const setSessionCookie = (res, token, req) => {
+  const secure = req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}${secure ? '; Secure' : ''}`);
+};
+const clearSessionCookie = (res) => res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+const createAdminSession = (username) => {
+  const token = randomBytes(32).toString('hex');
+  adminSessions.set(sessionTokenHash(token), { username, expiresAt: Date.now() + SESSION_TTL_MS });
+  return token;
+};
+const loginRateLimit = (req) => {
+  const ip = requestClientIp(req);
+  const now = Date.now();
+  let record = loginAttempts.get(ip);
+  if (!record || record.resetAt <= now) record = { failures: 0, resetAt: now + LOGIN_WINDOW_MS };
+  loginAttempts.set(ip, record);
+  return { ip, record, blocked: record.failures >= LOGIN_MAX_FAILURES };
+};
+const recordLoginFailure = (ip, record) => { record.failures += 1; record.resetAt = Math.max(record.resetAt, Date.now() + LOGIN_WINDOW_MS); loginAttempts.set(ip, record); };
+const clearLoginFailures = (ip) => loginAttempts.delete(ip);
 
 const modelCatalog = Object.fromEntries(Object.entries(MODEL_CATALOG_DEFAULTS).map(([provider, models]) => [provider, {
   provider,
@@ -152,6 +208,7 @@ const modelCatalog = Object.fromEntries(Object.entries(MODEL_CATALOG_DEFAULTS).m
 }]));
 
 const state = {
+  auth: { username: 'root', passwordSalt: '', passwordHash: '', passwordChangedAt: null },
   settings: {
     defaultSourceId: '',
     defaultModel: '',
@@ -173,6 +230,7 @@ const stateSnapshot = () => ({
   kind: 'relay-hub-runtime-state',
   version: 1,
   savedAt: new Date().toISOString(),
+  auth: { ...state.auth },
   settings: { ...state.settings },
   sources: state.sources.map((source) => ({
     id: source.id,
@@ -234,6 +292,7 @@ const safeRepositoryUrl = (value) => {
   }
 };
 const stateIdentity = (payload) => JSON.stringify({
+  auth: { username: payload?.auth?.username, passwordSalt: payload?.auth?.passwordSalt, passwordHash: payload?.auth?.passwordHash, passwordChangedAt: payload?.auth?.passwordChangedAt },
   sources: (payload?.sources || []).map((source) => ({ id: source.id, apiKey: source.apiKey, models: source.models, proxyEnabled: source.proxyEnabled })).sort((a, b) => a.id.localeCompare(b.id)),
   agents: (payload?.agents || []).map((agent) => ({ id: agent.id, relayApiKey: agent.relayApiKey, sourceId: agent.sourceId, model: agent.model })).sort((a, b) => a.id.localeCompare(b.id)),
 });
@@ -355,7 +414,7 @@ const publicAgent = (agent) => {
   ensureAgentCredentials(agent);
   return { ...agent, relayApiKey: maskSecret(agent.relayApiKey), endpoint: AGENT_ENDPOINTS[agent.id] || '/v1/chat/completions' };
 };
-const publicState = () => ({ ...state, settings: { ...state.settings, proxyConfigured: Boolean(proxyUrl()), proxySource: state.settings.proxyHost && state.settings.proxyPort ? 'settings' : (environmentProxyUrl() ? 'environment' : 'none'), logLevel }, agents: state.agents.map(publicAgent), sources: state.sources.map(publicSource) });
+const publicState = () => ({ settings: { ...state.settings, proxyConfigured: Boolean(proxyUrl()), proxySource: state.settings.proxyHost && state.settings.proxyPort ? 'settings' : (environmentProxyUrl() ? 'environment' : 'none'), logLevel }, sources: state.sources.map(publicSource), agents: state.agents.map(publicAgent), logs: state.logs, auth: { username: state.auth.username, passwordChangedAt: state.auth.passwordChangedAt } });
 
 const CONFIG_VERSION = 1;
 const isMaskedSecret = (value) => typeof value === 'string' && value.includes('••••');
@@ -479,6 +538,15 @@ const loadPersistentState = async () => {
     return false;
   }
   if (saved?.kind !== 'relay-hub-runtime-state' || Number(saved.version) !== 1) return false;
+
+  if (saved.auth && typeof saved.auth === 'object' && saved.auth.username && saved.auth.passwordSalt && saved.auth.passwordHash) {
+    state.auth = {
+      username: String(saved.auth.username),
+      passwordSalt: String(saved.auth.passwordSalt),
+      passwordHash: String(saved.auth.passwordHash),
+      passwordChangedAt: saved.auth.passwordChangedAt ? String(saved.auth.passwordChangedAt) : null,
+    };
+  }
 
   const restoredSources = Array.isArray(saved.sources) ? saved.sources.slice(0, 100).map((item, index) => {
     if (!item || typeof item !== 'object' || !String(item.name || '').trim()) return null;
@@ -796,11 +864,70 @@ const handler = async (req, res) => {
   const requestStarted = Date.now();
   req.relayLog = { requestId, route: pathname, method: req.method };
   res.setHeader('x-request-id', requestId);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
   res.on('finish', () => {
     const shouldRecord = pathname.startsWith('/v1/') || pathname.startsWith('/api/sources') || res.statusCode >= 400;
     if (shouldRecord) writeRuntimeLog('request', { level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', ...req.relayLog, status: res.statusCode, latencyMs: Date.now() - requestStarted });
     if (res.statusCode < 400 && ['POST', 'PATCH', 'DELETE'].includes(req.method) && (/^\/api\/(?:sources|agents|settings|config\/import)/.test(pathname))) persistState();
   });
+
+  if (pathname === '/api/auth/session' && req.method === 'GET') {
+    const session = getAdminSession(req);
+    return json(res, 200, { authenticated: Boolean(session), username: session?.username || null, passwordChanged: Boolean(state.auth.passwordChangedAt) });
+  }
+  if (pathname === '/api/auth/login' && req.method === 'POST') {
+    const { ip, record, blocked } = loginRateLimit(req);
+    if (blocked) {
+      res.setHeader('Retry-After', Math.max(1, Math.ceil((record.resetAt - Date.now()) / 1000)));
+      return json(res, 429, { error: '登录失败次数过多，请稍后再试' });
+    }
+    const body = await parseBody(req);
+    const username = String(body?.username || '');
+    const password = String(body?.password || '');
+    const usernameMatches = username === state.auth.username;
+    const passwordMatches = await verifyAdminPassword(password);
+    if (!usernameMatches || !passwordMatches) {
+      recordLoginFailure(ip, record);
+      writeRuntimeLog('audit', { level: 'warn', event: 'admin_login_failed', ip });
+      return json(res, 401, { error: '用户名或密码错误' });
+    }
+    clearLoginFailures(ip);
+    const token = createAdminSession(state.auth.username);
+    setSessionCookie(res, token, req);
+    addLog('route', 'Admin login succeeded', state.auth.username);
+    return json(res, 200, { authenticated: true, username: state.auth.username, passwordChanged: Boolean(state.auth.passwordChangedAt) });
+  }
+  if (pathname === '/api/auth/logout' && req.method === 'POST') {
+    const session = getAdminSession(req);
+    if (session) adminSessions.delete(session.key);
+    clearSessionCookie(res);
+    return json(res, 200, { ok: true });
+  }
+
+  if (pathname.startsWith('/api/') && !getAdminSession(req)) return json(res, 401, { error: '请先登录' });
+
+  if (pathname === '/api/auth/password' && req.method === 'POST') {
+    const session = getAdminSession(req);
+    const body = await parseBody(req);
+    const currentPassword = String(body?.currentPassword || '');
+    const newPassword = String(body?.newPassword || '');
+    if (newPassword.length < 8) return json(res, 400, { error: '新密码至少需要 8 个字符' });
+    if (newPassword === currentPassword) return json(res, 400, { error: '新密码不能与当前密码相同' });
+    if (!(await verifyAdminPassword(currentPassword))) return json(res, 401, { error: '当前密码错误' });
+    const passwordSalt = randomBytes(16).toString('hex');
+    state.auth.passwordSalt = passwordSalt;
+    state.auth.passwordHash = await hashPassword(newPassword, passwordSalt);
+    state.auth.passwordChangedAt = new Date().toISOString();
+    adminSessions.clear();
+    const token = createAdminSession(state.auth.username);
+    setSessionCookie(res, token, req);
+    addLog('route', 'Admin password changed', session?.username || state.auth.username);
+    await persistState();
+    return json(res, 200, { ok: true, username: state.auth.username, passwordChanged: true });
+  }
+
   if (pathname === '/api/state' && req.method === 'GET') return json(res, 200, publicState());
 
   if (pathname === '/api/config/export' && req.method === 'GET') {
@@ -1119,6 +1246,7 @@ const server = http.createServer((req, res) => handler(req, res).catch((error) =
 }));
 const port = Number(process.env.PORT || 4173);
 await loadPersistentState();
+await ensureAuthCredentials();
 await persistState();
 server.listen(port, () => {
   console.log(`Relay Hub running at http://localhost:${port}`);
@@ -1127,3 +1255,8 @@ server.listen(port, () => {
 refreshCatalogFromEnvironment().catch(() => {});
 setInterval(() => Promise.all([refreshCatalogFromEnvironment(), refreshConfiguredSourceModels()]).catch(() => {}), 6 * 60 * 60 * 1000).unref();
 setInterval(() => refreshModelProbes().catch(() => {}), 5 * 60 * 1000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, session] of adminSessions) if (session.expiresAt <= now) adminSessions.delete(key);
+  for (const [ip, attempt] of loginAttempts) if (attempt.resetAt <= now) loginAttempts.delete(ip);
+}, 15 * 60 * 1000).unref();

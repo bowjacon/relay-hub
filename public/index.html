@@ -10,7 +10,21 @@
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <div class="shell">
+    <div class="login-screen" id="loginScreen">
+      <form class="login-panel" id="loginForm">
+        <div class="brand login-brand"><div class="brand-mark"><i></i><i></i><i></i></div><div><strong>relay<span>hub</span></strong><small>API ROUTER</small></div></div>
+        <p class="kicker">ADMIN ACCESS</p>
+        <h1>登录控制台</h1>
+        <p class="login-lede">管理 API 来源、Agent 路由和运行日志。</p>
+        <label>用户名<input name="username" value="root" autocomplete="username" required /></label>
+        <label>密码<input name="password" type="password" autocomplete="current-password" required /></label>
+        <p class="login-error" id="loginError" role="alert"></p>
+        <button class="primary login-submit" type="submit">登录 <span>→</span></button>
+        <small class="login-hint">首次登录使用 root / admin，请在设置中立即修改密码。</small>
+      </form>
+    </div>
+
+    <div class="shell app-locked" id="appShell">
       <aside class="sidebar">
         <div class="brand"><div class="brand-mark"><i></i><i></i><i></i></div><div><strong>relay<span>hub</span></strong><small>API ROUTER</small></div></div>
         <div class="workspace"><span>A</span><div><b>Antares workspace</b><small>个人工作区</small></div><em>⌄</em></div>
@@ -19,7 +33,7 @@
       </aside>
 
       <main>
-        <header class="topbar"><div><span class="muted">工作区</span><span class="slash">/</span><b>路由控制台</b></div><div class="top-actions"><span class="server-status"><i></i>服务运行中</span><button id="refreshBtn" class="text-icon" title="刷新状态">↻</button></div></header>
+        <header class="topbar"><div><span class="muted">工作区</span><span class="slash">/</span><b>路由控制台</b></div><div class="top-actions"><span class="server-status"><i></i>服务运行中</span><span class="session-user" id="sessionUsername"></span><button id="logoutBtn" class="text-button logout-button" type="button">退出</button><button id="refreshBtn" class="text-icon" title="刷新状态">↻</button></div></header>
         <section class="heading"><div><p class="kicker" id="pageKicker">ROUTING CONTROL</p><h1 id="pageTitle">把每个 Agent 接到你选择的来源</h1><p class="lede" id="pageLede">按 Agent 指定模型、主来源和备用来源。没有配置的来源不会参与请求。</p></div><button id="addSourceBtn" class="primary"><span>＋</span>添加来源</button></section>
 
         <section class="notice" id="emptyNotice"><span>!</span><div><b>还没有 API 来源</b><p>先添加一个 OpenAI-compatible、DeepSeek 或 Anthropic 来源，再为 Agent 选择路由。</p></div><button id="noticeAddBtn" class="outline">添加第一个来源 <span>→</span></button></section>
@@ -31,6 +45,7 @@
         <section class="panel logs" id="logs"><div class="panel-head"><div><h2>请求日志</h2><p>记录路由变更、健康检查和转发结果</p></div><button id="clearLogsBtn" class="text-button">清空</button></div><div id="activityList" class="activity-list"></div></section>
 
         <section class="panel settings" id="settings"><div class="settings-intro"><p class="kicker">RUNTIME SETTINGS</p><h2>本机运行配置</h2><p>代理地址和端口只保存在当前服务器，不会随配置文件导出。</p><div class="endpoint-grid"><div><label>Codex CLI / Responses</label><code>/v1/responses</code></div><div><label>Claude Code / Messages</label><code>/v1/messages</code></div><div><label>DSH / OpenAI-compatible</label><code>/v1/chat/completions</code></div></div><button id="copyEndpointBtn" class="outline">复制基础地址</button></div><div class="runtime-settings"><h3>HTTP 代理</h3><div class="settings-form"><label>地址<input id="proxyHost" placeholder="127.0.0.1 或 proxy.example.com" autocomplete="off" /></label><label>端口<input id="proxyPort" type="number" min="1" max="65535" placeholder="1080" /></label><label>协议<select id="proxyProtocol"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label></div><small class="settings-hint">仅对勾选“通过本机 HTTP 代理”的来源生效；留空则回退到服务进程的 <code>http_proxy</code> 环境变量。</small><button id="saveRuntimeSettingsBtn" class="primary small">保存本机设置</button><span id="proxyState" class="saved-state"></span><hr /><h3>配置迁移</h3><div class="config-actions"><button id="exportConfigBtn" class="outline">导出脱敏配置</button><button id="exportSecretsBtn" class="outline">导出含凭据配置</button><label class="file-button outline">选择配置文件<input id="configFileInput" type="file" accept="application/json,.json" /></label></div><textarea id="configText" class="config-text" rows="7" placeholder="将 relay-hub-config JSON 粘贴到这里，或直接把配置文件拖入此区域"></textarea><div id="configDropHint" class="config-drop-hint">支持将 `.json` 配置文件拖入上方输入框；导入会清空当前来源、路由和运行统计。</div><button id="importConfigBtn" class="primary small">导入配置</button></div></section>
+        <section class="panel account-settings" id="accountSettings"><div class="panel-head"><div><h2>账户安全</h2><p>修改管理后台登录密码；修改后当前会话会自动续接。</p></div><span class="saved-state">管理员：<span id="accountUsername">root</span></span></div><form id="passwordForm" class="password-form"><label>当前密码<input name="currentPassword" type="password" autocomplete="current-password" required /></label><label>新密码<input name="newPassword" type="password" autocomplete="new-password" minlength="8" required /></label><label>确认新密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label><button class="primary small" type="submit">修改密码</button><small class="settings-hint">新密码至少 8 个字符。密码只保存为不可逆哈希，不会导出到配置文件。</small></form></section>
         <section class="panel updates" id="updates"><div class="panel-head"><div><h2>软件更新</h2><p>检查 GitHub 远程仓库；升级不会覆盖 API 来源、Agent Key 或本机代理设置。</p></div><span class="saved-state" id="updateState">未检查</span></div><div class="update-body"><div class="update-meta"><span>当前版本 <code id="currentCommit">—</code></span><span>远程版本 <code id="latestCommit">—</code></span><span id="updateRepository">—</span></div><div class="update-actions"><button id="checkUpdateBtn" class="outline">检查更新</button><button id="applyUpdateBtn" class="primary small" disabled>立即升级</button></div><small id="updateHint" class="settings-hint">升级前会保存并校验当前来源和 Agent Key。</small></div></section>
         <footer>Relay Hub v0.2.0 <span>·</span> OpenAI-compatible relay control plane</footer>
       </main>
@@ -38,6 +53,6 @@
 
     <div class="modal-backdrop" id="sourceModal" aria-hidden="true"><div class="modal"><div class="modal-head"><div><p class="kicker">UPSTREAM SOURCE</p><h2 id="modalTitle">添加 API 来源</h2></div><button id="closeModalBtn" class="close" title="关闭">×</button></div><form id="sourceForm"><input type="hidden" name="id" /><label>名称<input name="name" required placeholder="例如：我的 OpenAI 账号" /></label><div class="form-row"><label>API 来源<select name="sourceKind" id="sourceKind"><option value="official_openai">OpenAI 官方 API</option><option value="official_deepseek">DeepSeek 官方 API</option><option value="official_anthropic">Claude 官方 API</option><option value="third_party">第三方中转站 API</option></select></label><label>优先级<input name="priority" type="number" min="1" value="100" /></label></div><div id="thirdPartyFields" class="third-party-fields"><label>协议<select name="type" id="sourceType"><option>OpenAI Compatible</option><option>DeepSeek</option><option>Anthropic</option></select></label><label>Base URL<input name="baseUrl" id="sourceBaseUrl" type="url" placeholder="https://api.example.com/v1" /></label></div><label class="proxy-setting"><input name="proxyEnabled" id="proxyEnabled" type="checkbox" value="true" /><span>通过本机 HTTP 代理</span><small>使用服务器的 <code>http_proxy</code> 环境变量</small></label><label>API Key<input name="apiKey" type="password" placeholder="新增时填写；编辑留空保留旧 Key" /></label><div class="catalog-line"><label>官方模型目录<select id="catalogProvider"><option value="openai">OpenAI</option><option value="anthropic">Claude / Anthropic</option><option value="deepseek">DeepSeek</option></select></label><button type="button" id="refreshModelsBtn" class="outline">刷新目录</button></div><div class="catalog-meta" id="catalogMeta">后台缓存目录，支持按 API Key 刷新当前账号可用模型</div><label>选择模型 <small>可多选；按住 Ctrl / ⌘ 选择多个</small><select id="modelsSelect" name="models" multiple size="7"></select></label><label>自定义模型 ID <small>逗号分隔，适合第三方中转站</small><input name="customModels" placeholder="provider/model-name" /></label><div class="modal-actions"><button type="button" id="cancelModalBtn" class="outline">取消</button><button type="submit" class="primary">保存来源 <span>→</span></button></div></form></div></div>
     <div class="toast" id="toast"></div>
-    <script src="/app.js?v=20260914-claude-relay" type="module"></script>
+    <script src="/app.js?v=20260914-auth" type="module"></script>
   </body>
 </html>

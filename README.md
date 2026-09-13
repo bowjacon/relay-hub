@@ -15,6 +15,7 @@
 - 运行日志按 JSONL 写入 `logs/`，默认按 20MB 单文件轮转、保留 10 个文件并清理 14 天前日志；不会记录完整 prompt、响应正文或认证密钥。
 - 设置页支持配置当前服务器的 HTTP 代理地址、端口和协议；来源只有开启代理开关后才使用该代理。代理设置属于本机运行环境，不会随迁移配置导出。
 - 设置页支持导出/导入 JSON 配置；默认导出脱敏配置，另有明确确认后的含凭据导出。配置文件可直接拖入网页输入框，导入不会包含日志、调用统计或代理设置。服务会把来源、路由和 Agent Key 持久化到本机 `data/relay-hub-state.json`，重启不会更换已生成的 Key；该目录已加入忽略规则且不在发布白名单内。
+- 管理后台需要登录；首次启动默认用户名为 `root`、密码为 `admin`。登录后请立即在“设置 → 账户安全”修改密码。密码以加盐哈希保存在本机状态文件中，配置导入/导出不会覆盖密码；后台会话使用 HttpOnly Cookie，连续登录失败会临时限流。`/v1/*` 仍使用各 Agent 专属 API Key，不依赖后台网页登录。
 
 ## 启动
 
@@ -23,6 +24,8 @@ npm run dev
 ```
 
 浏览器打开 <http://localhost:4173>。
+
+生产环境请在反向代理后启用 HTTPS，再开放管理页面；否则登录密码会通过明文 HTTP 传输。不要将 `data/relay-hub-state.json`、`.env` 或含凭据导出文件提交到仓库。
 
 当前发布仓库：<https://github.com/bowjacon/relay-hub>
 
@@ -78,6 +81,10 @@ GET  /api/config/export?includeSecrets=false
 POST /api/config/import
 GET  /api/update/check
 POST /api/update/apply
+GET  /api/auth/session
+POST /api/auth/login
+POST /api/auth/logout
+POST /api/auth/password
 ```
 
 `POST /api/models/refresh` 可传 `sourceId` 使用已保存来源的 Key，也可传 `provider`、`apiKey`、`baseUrl` 临时刷新。官方接口不可用时返回最近一次成功缓存或内置目录，不会清空已有模型。
