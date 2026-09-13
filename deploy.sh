@@ -6,6 +6,35 @@ DEPLOY_TIMEOUT_GIT="${DEPLOY_TIMEOUT_GIT:-180}"
 DEPLOY_TIMEOUT_NPM="${DEPLOY_TIMEOUT_NPM:-300}"
 DEPLOY_TIMEOUT_STOP="${DEPLOY_TIMEOUT_STOP:-30}"
 DEPLOY_TIMEOUT_START="${DEPLOY_TIMEOUT_START:-30}"
+DEPLOY_MODE="update"
+case "${1:-}" in
+  ''|update|--update) DEPLOY_MODE="update" ;;
+  direct|--direct|deploy|--deploy) DEPLOY_MODE="direct" ;;
+  update|--update) DEPLOY_MODE="update" ;;
+  restart|--restart) DEPLOY_MODE="restart" ;;
+  -h|--help)
+    cat <<'USAGE'
+用法：bash deploy.sh [选项]
+
+  --direct, direct   使用当前目录代码直接部署，不执行 git pull
+  --update, update   拉取远程更新后安装依赖并部署
+  --restart, restart 只重启当前版本，不拉取代码、不安装依赖
+  --deploy, deploy   直接部署当前代码；首次安装时自动克隆仓库
+
+环境变量：
+  RELAY_HUB_RESTART=1       部署后重启已运行服务
+  DEPLOY_TIMEOUT_GIT=180     Git 操作超时秒数
+  DEPLOY_TIMEOUT_NPM=300     npm 安装超时秒数
+  DEPLOY_TIMEOUT_STOP=30     停止旧服务超时秒数
+  DEPLOY_TIMEOUT_START=30    启动检查超时秒数
+USAGE
+    exit 0
+    ;;
+  *)
+    echo "未知选项：$1（使用 --help 查看用法）" >&2
+    exit 2
+    ;;
+esac
 export GIT_TERMINAL_PROMPT="${GIT_TERMINAL_PROMPT:-0}"
 export npm_config_fetch_timeout="${npm_config_fetch_timeout:-60000}"
 export npm_config_fetch_retries="${npm_config_fetch_retries:-1}"
@@ -84,7 +113,11 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 if [ -d "$APP_DIR/.git" ]; then
-  run_step "拉取 Git 更新" "$DEPLOY_TIMEOUT_GIT" git -C "$APP_DIR" pull --ff-only
+  if [ "$DEPLOY_MODE" = "update" ]; then
+    run_step "拉取 Git 更新" "$DEPLOY_TIMEOUT_GIT" git -C "$APP_DIR" pull --ff-only
+  else
+    progress "直接使用当前代码，跳过 Git 拉取（模式：${DEPLOY_MODE}）"
+  fi
 elif [ -e "$APP_DIR" ]; then
   echo "目标目录已存在但不是 Git 仓库：$APP_DIR" >&2
   exit 1
@@ -93,7 +126,11 @@ else
 fi
 
 cd "$APP_DIR"
-run_step "安装 npm 依赖" "$DEPLOY_TIMEOUT_NPM" npm install --omit=dev
+if [ "$DEPLOY_MODE" = "restart" ]; then
+  progress "重启模式：跳过 npm 依赖安装"
+else
+  run_step "安装 npm 依赖" "$DEPLOY_TIMEOUT_NPM" npm install --omit=dev
+fi
 mkdir -p data logs
 [ -f .env ] || cp .env.example .env
 
