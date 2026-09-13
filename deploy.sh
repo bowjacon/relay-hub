@@ -27,13 +27,14 @@ npm install --omit=dev
 mkdir -p data logs
 [ -f .env ] || cp .env.example .env
 
+set -a
+# shellcheck disable=SC1091
+. ./.env
+set +a
+
 if [ -f .relay-hub.pid ] && kill -0 "$(cat .relay-hub.pid)" 2>/dev/null; then
   echo "Relay Hub 已在运行，PID $(cat .relay-hub.pid)"
 else
-  set -a
-  # shellcheck disable=SC1091
-  . ./.env
-  set +a
   nohup npm start > logs/console.log 2>&1 &
   echo $! > .relay-hub.pid
   sleep 1
