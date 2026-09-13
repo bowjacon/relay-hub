@@ -20,6 +20,8 @@ main { width:calc(100% - 235px); margin-left:235px; max-width:1470px; padding:0 
 @media (max-width:800px) { .agent-credentials { grid-template-columns:1fr; }.agent-credentials>div { grid-template-columns:auto minmax(0,1fr) auto; }.agent-credentials>button { justify-self:start; } }
 @media (max-width:470px) { h1 { font-size:26px; }.notice { align-items:flex-start; flex-wrap:wrap; }.notice .outline { margin-left:34px; }.head-actions .outline { display:none; }.endpoint-grid code { font-size:9px; } }
 
+@media (max-width:800px) { .update-body { align-items:flex-start; flex-direction:column; padding:14px; }.update-actions { width:100%; }.update-actions button { flex:1; } }
+
 .modal select[multiple] { min-height:150px; padding:5px; }
 .modal select[multiple] option { padding:5px 7px; border-radius:2px; }
 .modal select[multiple] option:checked { background:rgba(97,228,196,.22); color:var(--mint); }
