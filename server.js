@@ -515,6 +515,17 @@ const importConfig = async (payload = {}) => {
 
 const providerFromType = (type) => type === 'Anthropic' ? 'anthropic' : type === 'DeepSeek' ? 'deepseek' : 'openai';
 const providerFromSourceKind = (sourceKind) => OFFICIAL_SOURCE_CONFIG[sourceKind]?.provider || null;
+const normalizeThirdPartyBaseUrl = (value, type) => {
+  const raw = String(value || '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if ((type === 'OpenAI Compatible' || type === 'Anthropic') && (!parsed.pathname || parsed.pathname === '/')) parsed.pathname = '/v1';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return raw;
+  }
+};
 const normalizeSourceInput = (body = {}, existing = null) => {
   const sourceKind = body.sourceKind || existing?.sourceKind || 'third_party';
   const official = OFFICIAL_SOURCE_CONFIG[sourceKind];
@@ -524,7 +535,7 @@ const normalizeSourceInput = (body = {}, existing = null) => {
     sourceKind: 'third_party',
     provider: providerFromType(type),
     type,
-    baseUrl: String(body.baseUrl ?? existing?.baseUrl ?? '').replace(/\/$/, ''),
+    baseUrl: normalizeThirdPartyBaseUrl(body.baseUrl ?? existing?.baseUrl ?? '', type),
     proxyEnabled: parseBoolean(body.proxyEnabled, existing?.proxyEnabled || false),
   };
 };
@@ -852,9 +863,16 @@ const toOpenAIRequest = (body, protocol, model) => {
 
 const fromOpenAIResponse = (payload, protocol, model) => {
   const choice = payload?.choices?.[0];
-  const text = choice?.message?.content || '';
+  const text = Array.isArray(choice?.message?.content) ? choice.message.content.map((part) => typeof part === 'string' ? part : part?.text || '').join('') : choice?.message?.content || '';
   if (protocol === 'responses') return { id: payload.id || `resp-${Date.now()}`, object: 'response', status: 'completed', model: payload.model || model, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }], output_text: text, usage: payload.usage };
   return { id: payload.id || `msg-${Date.now()}`, type: 'message', role: 'assistant', model: payload.model || model, content: [{ type: 'text', text }], stop_reason: choice?.finish_reason || 'end_turn', usage: payload.usage ? { input_tokens: payload.usage.prompt_tokens, output_tokens: payload.usage.completion_tokens } : undefined };
+};
+const normalizeOpenAIResponse = (text, protocol, model) => {
+  if (!String(text || '').trim()) throw new Error('上游返回空响应');
+  let payload;
+  try { payload = JSON.parse(text); } catch { throw new Error('上游返回的不是有效 JSON（可能是错误页面或代理拦截）'); }
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.choices) || !payload.choices[0]?.message) throw new Error('上游返回格式不兼容，缺少 choices.message');
+  return fromOpenAIResponse(payload, protocol, model);
 };
 
 const handler = async (req, res) => {
@@ -1215,14 +1233,27 @@ const handler = async (req, res) => {
         const targetPath = targetProtocol === 'anthropic' ? '/messages' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
-        const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         const text = await upstream.text();
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
         if (upstream.ok || candidate === candidates.at(-1)) {
-          res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' });
-          if (!upstream.ok || targetProtocol !== 'openai' || body.stream) return res.end(text);
-          try { return res.end(JSON.stringify(fromOpenAIResponse(JSON.parse(text), protocol, candidateModel))); } catch { return res.end(text); }
+          if (!upstream.ok || targetProtocol !== 'openai' || body.stream) {
+            res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' });
+            return res.end(text);
+          }
+          try {
+            const normalizedResponse = normalizeOpenAIResponse(text, protocol, candidateModel);
+            res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
+            return res.end(JSON.stringify(normalizedResponse));
+          } catch (error) {
+            req.relayLog.error = safeLogText(error.message);
+            if (candidate !== candidates.at(-1)) {
+              addLog('warning', 'Primary source returned malformed response, trying fallback', `${candidate.name} → ${candidates[candidates.indexOf(candidate) + 1]?.name || 'none'}`);
+              continue;
+            }
+            return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } });
+          }
         }
         addLog('warning', 'Primary source failed, trying fallback', `${candidate.name} → ${candidates[candidates.indexOf(candidate) + 1]?.name || 'none'}`);
       } catch (error) {
