@@ -875,8 +875,17 @@ const toOpenAIRequest = (body, protocol, model) => {
 const fromOpenAIResponse = (payload, protocol, model) => {
   const choice = payload?.choices?.[0];
   const text = Array.isArray(choice?.message?.content) ? choice.message.content.map((part) => typeof part === 'string' ? part : part?.text || '').join('') : choice?.message?.content || '';
+  const content = [];
+  if (text) content.push({ type: 'text', text });
+  for (const toolCall of choice?.message?.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(toolCall.function?.arguments || '{}'); } catch { input = { raw: toolCall.function?.arguments || '' }; }
+    content.push({ type: 'tool_use', id: toolCall.id || `toolu_${randomUUID()}`, name: toolCall.function?.name || 'tool', input });
+  }
+  if (!content.length) content.push({ type: 'text', text: '' });
+  const stopReason = (choice?.message?.tool_calls?.length || 0) > 0 ? 'tool_use' : choice?.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
   if (protocol === 'responses') return { id: payload.id || `resp-${Date.now()}`, object: 'response', status: 'completed', model: payload.model || model, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }], output_text: text, usage: payload.usage };
-  return { id: payload.id || `msg-${Date.now()}`, type: 'message', role: 'assistant', model: payload.model || model, content: [{ type: 'text', text }], stop_reason: choice?.finish_reason || 'end_turn', usage: payload.usage ? { input_tokens: payload.usage.prompt_tokens, output_tokens: payload.usage.completion_tokens } : undefined };
+  return { id: payload.id || `msg-${Date.now()}`, type: 'message', role: 'assistant', model: payload.model || model, content, stop_reason: stopReason, usage: payload.usage ? { input_tokens: payload.usage.prompt_tokens, output_tokens: payload.usage.completion_tokens } : undefined };
 };
 const normalizeOpenAIResponse = (text, protocol, model) => {
   if (!String(text || '').trim()) throw new Error('上游返回空响应');
@@ -886,15 +895,22 @@ const normalizeOpenAIResponse = (text, protocol, model) => {
   return fromOpenAIResponse(payload, protocol, model);
 };
 const writeAnthropicStream = (res, message) => {
-  const text = message.content?.[0]?.text || '';
   const inputTokens = Number(message.usage?.input_tokens || 0);
   const outputTokens = Number(message.usage?.output_tokens || 0);
   const writeEvent = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  writeEvent('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, stop_sequence: null } });
-  writeEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-  if (text) writeEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
-  writeEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason || 'end_turn', stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+  writeEvent('message_start', { type: 'message_start', message: { ...message, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: inputTokens, output_tokens: 0 } } });
+  const blocks = message.content?.length ? message.content : [{ type: 'text', text: '' }];
+  blocks.forEach((block, index) => {
+    if (block.type === 'tool_use') {
+      writeEvent('content_block_start', { type: 'content_block_start', index, content_block: { type: 'tool_use', id: block.id || `toolu_${randomUUID()}`, name: block.name || 'tool', input: {} } });
+      writeEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input || {}) } });
+    } else {
+      writeEvent('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+      if (block.text) writeEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } });
+    }
+    writeEvent('content_block_stop', { type: 'content_block_stop', index });
+  });
+  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason || 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
@@ -906,9 +922,12 @@ const streamOpenAIAsAnthropic = async (res, upstream, model) => {
   let finishReason = 'end_turn';
   let usage = { input_tokens: 0, output_tokens: 0 };
   let messageId = `msg_${randomUUID()}`;
+  let textBlockStarted = false;
+  let textBlockIndex = 0;
+  let nextBlockIndex = 0;
+  const toolBlocks = new Map();
   const writeEvent = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   writeEvent('message_start', { type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage } });
-  writeEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
   const processLine = (line) => {
     const data = line.trim().replace(/^data:\s*/, '');
     if (!data || data === '[DONE]') return data === '[DONE]';
@@ -917,8 +936,26 @@ const streamOpenAIAsAnthropic = async (res, upstream, model) => {
     const choice = payload.choices?.[0];
     const delta = choice?.delta?.content;
     const content = Array.isArray(delta) ? delta.map((part) => typeof part === 'string' ? part : part?.text || '').join('') : delta;
-    if (content) writeEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: content } });
-    if (choice?.finish_reason) finishReason = choice.finish_reason === 'stop' ? 'end_turn' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
+    if (content) {
+      if (!textBlockStarted) {
+        textBlockStarted = true;
+        textBlockIndex = nextBlockIndex++;
+        writeEvent('content_block_start', { type: 'content_block_start', index: textBlockIndex, content_block: { type: 'text', text: '' } });
+      }
+      writeEvent('content_block_delta', { type: 'content_block_delta', index: textBlockIndex, delta: { type: 'text_delta', text: content } });
+    }
+    for (const toolCall of delta?.tool_calls || choice?.delta?.tool_calls || []) {
+      const toolIndex = Number(toolCall.index || 0);
+      let block = toolBlocks.get(toolIndex);
+      if (!block) {
+        block = { index: nextBlockIndex++, id: toolCall.id || `toolu_${randomUUID()}`, name: toolCall.function?.name || 'tool' };
+        toolBlocks.set(toolIndex, block);
+        writeEvent('content_block_start', { type: 'content_block_start', index: block.index, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } });
+      }
+      const argumentsDelta = toolCall.function?.arguments || '';
+      if (argumentsDelta) writeEvent('content_block_delta', { type: 'content_block_delta', index: block.index, delta: { type: 'input_json_delta', partial_json: argumentsDelta } });
+    }
+    if (choice?.finish_reason) finishReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : choice.finish_reason === 'stop' ? 'end_turn' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
     if (payload.usage) usage = { input_tokens: Number(payload.usage.prompt_tokens || payload.usage.input_tokens || 0), output_tokens: Number(payload.usage.completion_tokens || payload.usage.output_tokens || 0) };
     if (payload.id) messageId = String(payload.id);
     return false;
@@ -933,8 +970,14 @@ const streamOpenAIAsAnthropic = async (res, upstream, model) => {
     for (const line of lines) if (processLine(line)) { done = true; break; }
   }
   if (buffer.trim()) processLine(buffer);
-  writeEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
-  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finishReason, stop_sequence: null }, usage });
+  if (!textBlockStarted && !toolBlocks.size) {
+    textBlockStarted = true;
+    textBlockIndex = nextBlockIndex++;
+    writeEvent('content_block_start', { type: 'content_block_start', index: textBlockIndex, content_block: { type: 'text', text: '' } });
+  }
+  if (textBlockStarted) writeEvent('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+  for (const block of toolBlocks.values()) writeEvent('content_block_stop', { type: 'content_block_stop', index: block.index });
+  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finishReason, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } });
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
