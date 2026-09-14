@@ -13,6 +13,7 @@
 - API 来源支持 OpenAI、DeepSeek、Claude 官方 API，以及自定义协议和地址的第三方中转站；官方来源的协议和地址由后台自动填充。
 - 第三方 OpenAI-compatible / Anthropic 来源如果只填写域名（例如 `https://gateway.example.com`），后台会自动补全 `/v1`；转发时会校验上游响应必须是有效 JSON，若对方返回首页 HTML 或空内容，会明确返回 502，而不是把错误伪装成 HTTP 200。
 - Claude CLI 对第三方 OpenAI-compatible 来源发起流式请求时，后台会将上游非流式 JSON 转换为 Anthropic Messages SSE 事件，避免把 OpenAI SSE 直接透传造成“HTTP 200 但响应格式错误”。
+- 长对话转发默认超时为 180 秒（最大 600 秒），旧版状态文件中的 30 秒超时会在升级后自动提升；可通过 `.env` 的 `REQUEST_TIMEOUT_MS` 调整。请求日志会记录请求体大小、上游状态和响应类型，但不会记录对话正文或密钥。
 - 每个 API 来源可单独开启本机 HTTP 代理；开启后优先使用设置页保存的地址、端口和协议，设置留空时回退到服务进程的 `http_proxy`（兼容大写 `HTTP_PROXY`）环境变量。
 - 运行日志按 JSONL 写入 `logs/`，默认按 20MB 单文件轮转、保留 10 个文件并清理 14 天前日志；不会记录完整 prompt、响应正文或认证密钥。
 - 设置页支持配置当前服务器的 HTTP 代理地址、端口和协议；来源只有开启代理开关后才使用该代理。代理设置属于本机运行环境，不会随迁移配置导出。

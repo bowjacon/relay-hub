@@ -1227,6 +1227,7 @@ const handler = async (req, res) => {
   if (pathname === '/v1/chat/completions' && req.method === 'POST') {
     const body = await parseBody(req);
     if (!body) return json(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    req.relayLog.payloadBytes = Buffer.byteLength(JSON.stringify(body));
     const auth = relayRequestAuth(req, body);
     if (!auth.authenticated) return json(res, 401, { error: { message: auth.error || 'Relay API key required', type: 'authentication_error' } });
     const agent = auth.agent;
@@ -1266,6 +1267,7 @@ const handler = async (req, res) => {
   const relayCompatibleRequest = async (protocol) => {
     const body = await parseBody(req);
     if (!body) return json(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    req.relayLog.payloadBytes = Buffer.byteLength(JSON.stringify(body));
     const auth = relayRequestAuth(req, body);
     if (!auth.authenticated) return json(res, 401, { error: { message: auth.error || 'Relay API key required', type: 'authentication_error' } });
     const agent = auth.agent;
@@ -1298,6 +1300,8 @@ const handler = async (req, res) => {
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        req.relayLog.upstreamStatus = upstream.status;
+        req.relayLog.upstreamContentType = upstream.headers.get('content-type') || '';
         if (upstream.ok && targetProtocol === 'openai' && body.stream && upstream.headers.get('content-type')?.includes('text/event-stream')) {
           recordModelCall(candidate, true, Date.now() - started, candidateModel);
           candidate.requests += 1;
