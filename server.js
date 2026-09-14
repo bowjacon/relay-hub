@@ -1208,7 +1208,7 @@ const handler = async (req, res) => {
     const nextProxyHost = patch.proxyHost !== undefined ? String(patch.proxyHost || '').trim() : state.settings.proxyHost;
     const nextProxyPort = patch.proxyPort !== undefined ? (patch.proxyPort === '' ? '' : Math.min(65535, Math.max(1, Number(patch.proxyPort) || 1))) : state.settings.proxyPort;
     if ((nextProxyHost && !nextProxyPort) || (!nextProxyHost && nextProxyPort)) return json(res, 400, { error: '本机代理地址和端口必须同时填写，或同时留空' });
-    if (patch.requestTimeout !== undefined) state.settings.requestTimeout = Math.min(120000, Math.max(1000, Number(patch.requestTimeout) || 30000));
+    if (patch.requestTimeout !== undefined) state.settings.requestTimeout = Math.min(600000, Math.max(10000, Number(patch.requestTimeout) || defaultRequestTimeout));
     if (patch.defaultSourceId !== undefined) state.settings.defaultSourceId = String(patch.defaultSourceId || '');
     if (patch.defaultModel !== undefined) state.settings.defaultModel = String(patch.defaultModel || '');
     if (patch.proxyHost !== undefined) state.settings.proxyHost = nextProxyHost;
