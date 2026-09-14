@@ -30,6 +30,7 @@ const updateCommandTimeout = 180000;
 const logMaxBytes = Math.max(1024 * 1024, Number(process.env.LOG_MAX_SIZE_MB || 20) * 1024 * 1024);
 const logMaxFiles = Math.max(2, Number(process.env.LOG_MAX_FILES || 10));
 const logRetentionDays = Math.max(1, Number(process.env.LOG_RETENTION_DAYS || 14));
+const defaultRequestTimeout = Math.min(600000, Math.max(10000, Number(process.env.REQUEST_TIMEOUT_MS) || 180000));
 const proxyAgents = new Map();
 const logQueues = new Map();
 const runtimeLogMemory = new Map();
@@ -212,7 +213,7 @@ const state = {
   settings: {
     defaultSourceId: '',
     defaultModel: '',
-    requestTimeout: 30000,
+    requestTimeout: defaultRequestTimeout,
     proxyHost: '',
     proxyPort: '',
     proxyProtocol: 'http',
@@ -506,7 +507,7 @@ const importConfig = async (payload = {}) => {
   const settings = config.settings && typeof config.settings === 'object' ? config.settings : {};
   state.settings.defaultSourceId = sourceIds.has(String(settings.defaultSourceId || '')) ? String(settings.defaultSourceId) : '';
   state.settings.defaultModel = String(settings.defaultModel || '');
-  state.settings.requestTimeout = Math.min(120000, Math.max(1000, Number(settings.requestTimeout) || 30000));
+  state.settings.requestTimeout = Math.min(600000, Math.max(10000, Number(settings.requestTimeout) || defaultRequestTimeout));
   state.logs = [];
   await clearRuntimeLogs();
   addLog('route', 'Configuration imported', `${sources.length} source${sources.length === 1 ? '' : 's'}`);
@@ -595,11 +596,12 @@ const loadPersistentState = async () => {
     ...state.settings,
     defaultSourceId: sourceIds.has(String(savedSettings.defaultSourceId || '')) ? String(savedSettings.defaultSourceId) : '',
     defaultModel: String(savedSettings.defaultModel || ''),
-    requestTimeout: Math.min(120000, Math.max(1000, Number(savedSettings.requestTimeout) || 30000)),
+    requestTimeout: Math.min(600000, Math.max(10000, Number(savedSettings.requestTimeout) || defaultRequestTimeout)),
     proxyHost: String(savedSettings.proxyHost || '').trim(),
     proxyPort: savedSettings.proxyPort === '' || savedSettings.proxyPort === undefined ? '' : Math.min(65535, Math.max(1, Number(savedSettings.proxyPort) || 1)),
     proxyProtocol: savedSettings.proxyProtocol === 'https' ? 'https' : 'http',
   };
+  if (!process.env.REQUEST_TIMEOUT_MS && Number(savedSettings.requestTimeout) === 30000) state.settings.requestTimeout = defaultRequestTimeout;
   const savedAgents = new Map(Array.isArray(saved.agents) ? saved.agents.filter((item) => item && typeof item === 'object').map((item) => [String(item.id), item]) : []);
   for (const agent of state.agents) {
     const item = savedAgents.get(agent.id);
@@ -736,7 +738,16 @@ const probeSourceModels = async (source, models = source.models) => {
 
 const parseBody = async (req) => {
   let data = '';
-  for await (const chunk of req) data += chunk;
+  let bytes = 0;
+  for await (const chunk of req) {
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 32 * 1024 * 1024) {
+      const error = new Error('请求体超过 32MB 限制，请减少对话上下文后重试');
+      error.statusCode = 413;
+      throw error;
+    }
+    data += chunk;
+  }
   if (!data) return {};
   try { return JSON.parse(data); } catch { return null; }
 };
@@ -884,6 +895,46 @@ const writeAnthropicStream = (res, message) => {
   if (text) writeEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } });
   writeEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
   writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason || 'end_turn', stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } });
+  writeEvent('message_stop', { type: 'message_stop' });
+  res.end();
+};
+const streamOpenAIAsAnthropic = async (res, upstream, model) => {
+  if (!upstream.body?.getReader) throw new Error('上游没有可读取的流响应');
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finishReason = 'end_turn';
+  let usage = { input_tokens: 0, output_tokens: 0 };
+  let messageId = `msg_${randomUUID()}`;
+  const writeEvent = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  writeEvent('message_start', { type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', model, content: [], stop_reason: null, stop_sequence: null, usage } });
+  writeEvent('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  const processLine = (line) => {
+    const data = line.trim().replace(/^data:\s*/, '');
+    if (!data || data === '[DONE]') return data === '[DONE]';
+    let payload;
+    try { payload = JSON.parse(data); } catch { return false; }
+    const choice = payload.choices?.[0];
+    const delta = choice?.delta?.content;
+    const content = Array.isArray(delta) ? delta.map((part) => typeof part === 'string' ? part : part?.text || '').join('') : delta;
+    if (content) writeEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: content } });
+    if (choice?.finish_reason) finishReason = choice.finish_reason === 'stop' ? 'end_turn' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
+    if (payload.usage) usage = { input_tokens: Number(payload.usage.prompt_tokens || payload.usage.input_tokens || 0), output_tokens: Number(payload.usage.completion_tokens || payload.usage.output_tokens || 0) };
+    if (payload.id) messageId = String(payload.id);
+    return false;
+  };
+  let done = false;
+  while (!done) {
+    const { value, done: readerDone } = await reader.read();
+    if (readerDone) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const line of lines) if (processLine(line)) { done = true; break; }
+  }
+  if (buffer.trim()) processLine(buffer);
+  writeEvent('content_block_stop', { type: 'content_block_stop', index: 0 });
+  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finishReason, stop_sequence: null }, usage });
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
@@ -1246,8 +1297,13 @@ const handler = async (req, res) => {
         const targetPath = targetProtocol === 'anthropic' ? '/messages' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
-        if (targetProtocol === 'openai' && protocol === 'anthropic' && body.stream) upstreamBody.stream = false;
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        if (upstream.ok && targetProtocol === 'openai' && body.stream && upstream.headers.get('content-type')?.includes('text/event-stream')) {
+          recordModelCall(candidate, true, Date.now() - started, candidateModel);
+          candidate.requests += 1;
+          res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+          try { return await streamOpenAIAsAnthropic(res, upstream, candidateModel); } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
+        }
         const text = await upstream.text();
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
@@ -1291,7 +1347,7 @@ const handler = async (req, res) => {
 
 const server = http.createServer((req, res) => handler(req, res).catch((error) => {
   writeRuntimeLog('error', { level: 'error', requestId: req.relayLog?.requestId, route: req.relayLog?.route || req.url, method: req.method, error: error.message });
-  return json(res, 500, { error: error.message });
+  return json(res, error.statusCode || 500, { error: error.message });
 }));
 const port = Number(process.env.PORT || 4173);
 await loadPersistentState();
