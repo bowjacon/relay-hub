@@ -394,9 +394,12 @@ const usageTokenCounts = (usage, protocol = 'openai') => {
     const cacheCreation = Number(usage.cache_creation_input_tokens) || 0;
     return { inputTokens: inputTokens + cacheRead + cacheCreation, cachedInputTokens: cacheRead };
   }
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens) || 0;
+  const promptCacheHit = Number(usage.prompt_cache_hit_tokens) || 0;
+  const promptCacheMiss = Number(usage.prompt_cache_miss_tokens) || 0;
   return {
-    inputTokens: Number(usage.prompt_tokens ?? usage.input_tokens) || 0,
-    cachedInputTokens: Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens) || 0,
+    inputTokens: promptTokens || promptCacheHit + promptCacheMiss,
+    cachedInputTokens: promptCacheHit || Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens) || 0,
   };
 };
 const recordTokenUsage = (source, model, usage, protocol = 'openai') => {
@@ -435,6 +438,7 @@ const parseUpstreamUsage = (text) => {
         const payload = JSON.parse(data);
         if (payload?.usage && typeof payload.usage === 'object') Object.assign(usage, payload.usage);
         if (payload?.message?.usage && typeof payload.message.usage === 'object') Object.assign(usage, payload.message.usage);
+        if (payload?.response?.usage && typeof payload.response.usage === 'object') Object.assign(usage, payload.response.usage);
       } catch {}
     }
     return Object.keys(usage).length ? usage : null;
@@ -950,7 +954,7 @@ const toOpenAIRequest = (body, protocol, model) => {
 
 const openAIUsageToAnthropic = (usage = {}) => {
   const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
-  const cachedTokens = Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0);
+  const cachedTokens = Number(usage.prompt_cache_hit_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0);
   const cacheCreationTokens = Number(usage.prompt_tokens_details?.cache_creation_tokens ?? usage.input_tokens_details?.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? 0);
   const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
   return {
@@ -1001,6 +1005,24 @@ const writeAnthropicStream = (res, message) => {
   });
   writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason || 'end_turn', stop_sequence: null }, usage: { output_tokens: outputTokens } });
   writeEvent('message_stop', { type: 'message_stop' });
+  res.end();
+};
+const streamUpstreamResponse = async (res, upstream, onUsage = null) => {
+  if (!upstream.body?.getReader) throw new Error('上游没有可读取的流响应');
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    text += chunk;
+    if (text.length > 8 * 1024 * 1024) text = text.slice(-8 * 1024 * 1024);
+    res.write(chunk);
+  }
+  text += decoder.decode();
+  const usage = parseUpstreamUsage(text);
+  if (usage) onUsage?.(usage);
   res.end();
 };
 const streamOpenAIAsAnthropic = async (res, upstream, model, relayLog = null, onUsage = null) => {
@@ -1439,30 +1461,35 @@ const handler = async (req, res) => {
         req.relayLog.sourceName = candidate.name;
         req.relayLog.proxyEnabled = Boolean(candidate.proxyEnabled);
         const sourceIsAnthropic = candidate.type === 'Anthropic';
-        const targetProtocol = protocol === 'anthropic' && sourceIsAnthropic ? 'anthropic' : 'openai';
-        const targetPath = targetProtocol === 'anthropic' ? '/messages' : '/chat/completions';
+        const deepseekOfficial = candidate.sourceKind === 'official_deepseek' || (candidate.provider === 'deepseek' && /api\.deepseek\.com/.test(candidate.baseUrl));
+        const targetProtocol = deepseekOfficial && protocol === 'anthropic' ? 'anthropic' : deepseekOfficial && protocol === 'responses' ? 'responses' : protocol === 'anthropic' && sourceIsAnthropic ? 'anthropic' : 'openai';
+        const targetPath = targetProtocol === 'anthropic' ? (deepseekOfficial ? '/anthropic/v1/messages' : '/messages') : targetProtocol === 'responses' ? '/responses' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         req.relayLog.upstreamStatus = upstream.status;
         req.relayLog.upstreamContentType = upstream.headers.get('content-type') || '';
-        if (upstream.ok && targetProtocol === 'openai' && body.stream && upstream.headers.get('content-type')?.includes('text/event-stream')) {
+        const recordUsage = (usage) => {
+          const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, targetProtocol === 'anthropic' ? 'anthropic' : 'openai');
+          if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
+          if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
+        };
+        if (upstream.ok && body.stream && upstream.headers.get('content-type')?.includes('text/event-stream') && targetProtocol === 'openai') {
           recordModelCall(candidate, true, Date.now() - started, candidateModel);
           candidate.requests += 1;
           res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
           try {
-            return await streamOpenAIAsAnthropic(res, upstream, candidateModel, req.relayLog, (usage) => {
-              const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, 'openai');
-              if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
-              if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
-            });
+            return await streamOpenAIAsAnthropic(res, upstream, candidateModel, req.relayLog, recordUsage);
           } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
         }
+        if (upstream.ok && body.stream && upstream.headers.get('content-type')?.includes('text/event-stream') && (targetProtocol === 'responses' || targetProtocol === 'anthropic')) {
+          recordModelCall(candidate, true, Date.now() - started, candidateModel);
+          candidate.requests += 1;
+          res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+          try { return await streamUpstreamResponse(res, upstream, recordUsage); } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
+        }
         const text = await upstream.text();
-        const usage = parseUpstreamUsage(text);
-        const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, targetProtocol);
-        if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
-        if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
+        recordUsage(parseUpstreamUsage(text));
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
         if (upstream.ok || candidate === candidates.at(-1)) {
