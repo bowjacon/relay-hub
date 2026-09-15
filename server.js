@@ -36,6 +36,7 @@ const logQueues = new Map();
 const runtimeLogMemory = new Map();
 const cachePrefixMemory = new Map();
 const requestPrefixMemory = new Map();
+const promptCacheKeySupport = new Map();
 let statePersistQueue = Promise.resolve();
 let updateOperation = null;
 
@@ -125,6 +126,30 @@ const fetchThroughSource = async (url, options = {}, source = null) => {
     proxyAgents.set(configuredProxy, dispatcher);
   }
   return fetch(url, { ...options, dispatcher });
+};
+
+const promptCacheKeySeed = (source) => String(process.env.RELAY_PROMPT_CACHE_KEY || (source?.sourceKind === 'third_party' ? 'relay-hub' : '')).trim();
+const promptCacheKeyFor = (source, model, agentId) => {
+  const seed = promptCacheKeySeed(source);
+  if (!seed || promptCacheKeySupport.get(source.id) === false) return '';
+  const value = `${seed}:${source.id}:${model}:${agentId || 'anonymous'}`;
+  return value.length <= 64 ? value : `relay-${createHash('sha256').update(value).digest('hex').slice(0, 58)}`;
+};
+const looksLikeUnsupportedPromptCacheKey = (text) => /prompt[_ -]?cache[_ -]?key|unknown\s+(?:field|parameter)|additional\s+propert(?:y|ies)|unrecognized\s+(?:field|parameter)/i.test(String(text || ''));
+const fetchOpenAIUpstream = async (url, options, source, body, promptCacheKey = '', onPromptCacheFallback = null) => {
+  let requestBody = body;
+  let response = await fetchThroughSource(url, { ...options, body: JSON.stringify(requestBody) }, source);
+  if (promptCacheKey && response.status === 400) {
+    const errorText = await response.clone().text().catch(() => '');
+    if (looksLikeUnsupportedPromptCacheKey(errorText)) {
+      promptCacheKeySupport.set(source.id, false);
+      onPromptCacheFallback?.();
+      requestBody = { ...body };
+      delete requestBody.prompt_cache_key;
+      response = await fetchThroughSource(url, { ...options, body: JSON.stringify(requestBody) }, source);
+    }
+  }
+  return response;
 };
 
 const emptyMetric = () => ({ calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null, inputTokens: 0, cachedInputTokens: 0, probeCalls: 0, probeSuccesses: 0, probeFailures: 0, probeTotalLatency: 0, lastProbeLatency: 0, lastProbeAt: null, lastProbeOk: null, consecutiveFailures: 0, lastError: null });
@@ -898,6 +923,17 @@ const inputToMessages = (input) => {
   });
 };
 
+const stripAnthropicCacheMarkers = (value) => {
+  if (Array.isArray(value)) return value.map(stripAnthropicCacheMarkers);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'cache_control').map(([key, item]) => [key, stripAnthropicCacheMarkers(item)]));
+};
+const stablePayload = (value) => {
+  if (Array.isArray(value)) return value.map(stablePayload);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stablePayload(value[key])]));
+};
+
 const anthropicToolToOpenAI = (tool) => {
   if (!tool || tool.type === 'function') return tool;
   return {
@@ -911,16 +947,17 @@ const anthropicToolToOpenAI = (tool) => {
 };
 
 const anthropicContentToOpenAI = (content) => {
-  if (!Array.isArray(content)) return content;
+  if (!Array.isArray(content)) return stripAnthropicCacheMarkers(content);
   return content.map((block) => {
-    if (block?.type === 'text') return block;
+    if (block?.type === 'text') return { type: 'text', text: block.text || '' };
     if (block?.type === 'image' && block.source?.type === 'base64') return { type: 'image_url', image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` } };
-    return block;
+    return stripAnthropicCacheMarkers(block);
   });
 };
 
 const anthropicMessagesToOpenAI = (messages = []) => messages.map((message) => ({
-  ...message,
+  role: message.role,
+  ...(message.name ? { name: message.name } : {}),
   content: anthropicContentToOpenAI(message.content),
 }));
 
@@ -972,24 +1009,25 @@ const addCacheDiagnostics = (relayLog, source, model, agentId, protocol, body, o
   if (previousOriginal) relayLog.requestPrefixChanged = previousOriginal !== originalFingerprint.hash;
 };
 
-const toOpenAIRequest = (body, protocol, model) => {
+const toOpenAIRequest = (body, protocol, model, promptCacheKey = '') => {
   if (protocol === 'responses') {
-    return { model, messages: inputToMessages(body.input), ...(body.instructions ? { messages: [{ role: 'system', content: body.instructions }, ...inputToMessages(body.input)] } : {}), ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}), ...(body.temperature !== undefined ? { temperature: body.temperature } : {}), ...(body.tools ? { tools: body.tools } : {}), ...(body.stream !== undefined ? { stream: body.stream } : {}), ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}) };
+    return stablePayload({ model, ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}), messages: inputToMessages(body.input), ...(body.instructions ? { messages: [{ role: 'system', content: body.instructions }, ...inputToMessages(body.input)] } : {}), ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}), ...(body.temperature !== undefined ? { temperature: body.temperature } : {}), ...(body.tools ? { tools: body.tools } : {}), ...(body.stream !== undefined ? { stream: body.stream } : {}), ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}) });
   }
-  const system = body.system ? [{ role: 'system', content: body.system }] : [];
+  const system = body.system ? [{ role: 'system', content: stripAnthropicCacheMarkers(body.system) }] : [];
   const messages = [...system, ...anthropicMessagesToOpenAI(body.messages || [])];
-  return {
+  return stablePayload({
     model,
+    ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
     messages,
     ...(body.max_tokens ? { max_tokens: body.max_tokens } : {}),
     ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
     ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
     ...(body.stream !== undefined ? { stream: body.stream } : {}),
     ...(body.stop_sequences ? { stop: body.stop_sequences } : {}),
-    ...(Array.isArray(body.tools) ? { tools: body.tools.map(anthropicToolToOpenAI) } : {}),
+    ...(Array.isArray(body.tools) ? { tools: body.tools.map((tool) => stripAnthropicCacheMarkers(anthropicToolToOpenAI(tool))) } : {}),
     ...(body.tool_choice ? { tool_choice: anthropicToolChoiceToOpenAI(body.tool_choice) } : {}),
     ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}),
-  };
+  });
 };
 
 const openAIUsageToAnthropic = (usage = {}) => {
@@ -1451,9 +1489,11 @@ const handler = async (req, res) => {
       const started = Date.now();
       try {
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
-        const upstreamBody = { ...body, model: candidateModel };
+        const promptCacheKey = body.prompt_cache_key || promptCacheKeyFor(candidate, candidateModel, agent.id);
+        req.relayLog.promptCacheKeyEnabled = Boolean(promptCacheKey);
+        const upstreamBody = { ...body, model: candidateModel, ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}) };
         addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, 'openai', upstreamBody, body);
-        const upstream = await fetchThroughSource(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        const upstream = await fetchOpenAIUpstream(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate, upstreamBody, promptCacheKey, () => { req.relayLog.promptCacheKeyFallback = true; });
         const text = await upstream.text();
         const usage = parseUpstreamUsage(text);
         const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, candidate.type === 'Anthropic' ? 'anthropic' : 'openai');
@@ -1507,9 +1547,13 @@ const handler = async (req, res) => {
         const targetProtocol = deepseekOfficial && protocol === 'anthropic' ? 'anthropic' : deepseekOfficial && protocol === 'responses' ? 'responses' : protocol === 'anthropic' && sourceIsAnthropic ? 'anthropic' : 'openai';
         const targetPath = targetProtocol === 'anthropic' ? (deepseekOfficial ? '/anthropic/v1/messages' : '/messages') : targetProtocol === 'responses' ? '/responses' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
-        const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
+        const promptCacheKey = targetProtocol === 'anthropic' ? '' : body.prompt_cache_key || promptCacheKeyFor(candidate, candidateModel, agent.id);
+        req.relayLog.promptCacheKeyEnabled = Boolean(promptCacheKey);
+        const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel, promptCacheKey) : { ...body, model: candidateModel, ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}) };
         addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, targetProtocol, upstreamBody, body);
-        const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        const upstream = targetProtocol === 'openai' || targetProtocol === 'responses'
+          ? await fetchOpenAIUpstream(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate, upstreamBody, promptCacheKey, () => { req.relayLog.promptCacheKeyFallback = true; })
+          : await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         req.relayLog.upstreamStatus = upstream.status;
         req.relayLog.upstreamContentType = upstream.headers.get('content-type') || '';
         const recordUsage = (usage) => {
