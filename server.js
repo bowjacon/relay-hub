@@ -55,7 +55,7 @@ const safeLogValue = (value, depth = 0) => {
   if (depth > 3) return '[TRUNCATED]';
   if (typeof value === 'string') return safeLogText(value);
   if (Array.isArray(value)) return value.slice(0, 20).map((item) => safeLogValue(item, depth + 1));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => [key, /authorization|api[-_]?key|token|secret|password|cookie/i.test(key) ? '[REDACTED]' : safeLogValue(item, depth + 1)]));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => [key, /authorization|api[-_]?key|secret|password|cookie/i.test(key) || /(?:^|[_-])token(?:$|[_-])/i.test(key) ? '[REDACTED]' : safeLogValue(item, depth + 1)]));
   return value;
 };
 const shouldWriteLog = (level) => (LOG_LEVELS[level] ?? LOG_LEVELS.info) <= LOG_LEVELS[logLevel];
