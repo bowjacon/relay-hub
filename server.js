@@ -982,7 +982,7 @@ const writeAnthropicStream = (res, message) => {
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
-const streamOpenAIAsAnthropic = async (res, upstream, model, relayLog = null) => {
+const streamOpenAIAsAnthropic = async (res, upstream, model, relayLog = null, onUsage = null) => {
   if (!upstream.body?.getReader) throw new Error('上游没有可读取的流响应');
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
@@ -1026,6 +1026,7 @@ const streamOpenAIAsAnthropic = async (res, upstream, model, relayLog = null) =>
     if (choice?.finish_reason) finishReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : choice.finish_reason === 'stop' ? 'end_turn' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
     if (payload.usage) {
       usage = openAIUsageToAnthropic(payload.usage);
+      onUsage?.(payload.usage);
       if (relayLog) {
         if (usage.cache_read_input_tokens) relayLog.cacheReadInputTokens = usage.cache_read_input_tokens;
         if (usage.cache_creation_input_tokens) relayLog.cacheCreationInputTokens = usage.cache_creation_input_tokens;
