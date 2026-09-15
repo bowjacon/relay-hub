@@ -9,6 +9,8 @@
 - OpenAI-compatible API：`/v1/chat/completions`、`/v1/models`。
 - Codex CLI 入口：`/v1/responses`。
 - Claude CLI 入口：`/v1/messages`。
+- DeepSeek 官方来源会保留原生协议：Claude 请求直连 `https://api.deepseek.com/anthropic/v1/messages`，Codex/Responses 请求直连 `https://api.deepseek.com/responses`，不会降级为 Chat Completions；其他来源仍按协议转换。
+- 来源页显示输入 token、缓存命中 token、总命中率及最近 14 天每日柱状图；统计按来源和模型持久化，最多保留 180 天每日汇总。
 - `dry_run=true` 或 `x-relay-dry-run: true` 可在没有上游凭据时验证选路。
 - API 来源支持 OpenAI、DeepSeek、Claude 官方 API，以及自定义协议和地址的第三方中转站；官方来源的协议和地址由后台自动填充。
 - 第三方 OpenAI-compatible / Anthropic 来源如果只填写域名（例如 `https://gateway.example.com`），后台会自动补全 `/v1`；转发时会校验上游响应必须是有效 JSON，若对方返回首页 HTML 或空内容，会明确返回 502，而不是把错误伪装成 HTTP 200。
@@ -84,6 +86,8 @@ Claude Code        http://localhost:4173/v1/messages
 路由页的“生成 / 轮换 Key”会立即使旧 Key 失效；明文 Key 只在轮换响应中返回一次，页面随后仅显示掩码。
 
 Claude Code 的 `ANTHROPIC_BASE_URL` 必须填写中转根地址（不要附加 `/v1/messages`）；若上游是 DeepSeek 或其他 OpenAI-compatible 来源，需同时设置 `ANTHROPIC_CUSTOM_MODEL_OPTION` 为路由页选择的上游模型。中转会将 Claude Messages 请求及工具定义转换为上游格式，并把响应转换回 Claude 格式。
+
+DeepSeek 官方 Anthropic 兼容层会自动处理模型名映射，且其 `cache_control` 标记不会改变服务端自动前缀缓存；中转统计会读取 DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`、OpenAI Responses 的 `input_tokens_details.cached_tokens` 以及 Anthropic 的缓存字段。
 
 ## 上游与生产化
 
