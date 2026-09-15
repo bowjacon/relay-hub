@@ -363,6 +363,12 @@ const ensureSourceStats = (source) => {
   source.tokenUsage.inputTokens = Number(source.tokenUsage.inputTokens) || 0;
   source.tokenUsage.cachedInputTokens = Number(source.tokenUsage.cachedInputTokens) || 0;
   source.tokenUsage.daily = source.tokenUsage.daily && typeof source.tokenUsage.daily === 'object' ? source.tokenUsage.daily : {};
+  const modelTokenTotals = Object.values(source.modelStats).reduce((totals, stats) => ({
+    inputTokens: totals.inputTokens + (Number(stats?.inputTokens) || 0),
+    cachedInputTokens: totals.cachedInputTokens + (Number(stats?.cachedInputTokens) || 0),
+  }), { inputTokens: 0, cachedInputTokens: 0 });
+  if (modelTokenTotals.inputTokens > source.tokenUsage.inputTokens) source.tokenUsage.inputTokens = modelTokenTotals.inputTokens;
+  if (modelTokenTotals.cachedInputTokens > source.tokenUsage.cachedInputTokens) source.tokenUsage.cachedInputTokens = modelTokenTotals.cachedInputTokens;
   return source;
 };
 
