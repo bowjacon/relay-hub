@@ -125,7 +125,7 @@ const fetchThroughSource = async (url, options = {}, source = null) => {
   return fetch(url, { ...options, dispatcher });
 };
 
-const emptyMetric = () => ({ calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null, probeCalls: 0, probeSuccesses: 0, probeFailures: 0, probeTotalLatency: 0, lastProbeLatency: 0, lastProbeAt: null, lastProbeOk: null, consecutiveFailures: 0, lastError: null });
+const emptyMetric = () => ({ calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null, inputTokens: 0, cachedInputTokens: 0, probeCalls: 0, probeSuccesses: 0, probeFailures: 0, probeTotalLatency: 0, lastProbeLatency: 0, lastProbeAt: null, lastProbeOk: null, consecutiveFailures: 0, lastError: null });
 
 const MODEL_CATALOG_DEFAULTS = {
   openai: [
@@ -252,6 +252,7 @@ const stateSnapshot = () => ({
     callStats: source.callStats,
     reachability: source.reachability,
     modelStats: source.modelStats,
+    tokenUsage: source.tokenUsage,
     requests: Number(source.requests) || 0,
     spend: Number(source.spend) || 0,
   })),
@@ -354,10 +355,14 @@ const json = (res, status, payload) => {
 };
 
 const ensureSourceStats = (source) => {
-  source.callStats ||= { calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null };
+  source.callStats = { ...emptyMetric(), ...(source.callStats || {}) };
   source.reachability ||= { checks: 0, successes: 0, lastChecked: null };
   source.modelStats ||= {};
-  for (const model of source.models || []) source.modelStats[model] ||= emptyMetric();
+  for (const model of source.models || []) source.modelStats[model] = { ...emptyMetric(), ...(source.modelStats[model] || {}) };
+  source.tokenUsage = { inputTokens: 0, cachedInputTokens: 0, daily: {}, ...(source.tokenUsage || {}) };
+  source.tokenUsage.inputTokens = Number(source.tokenUsage.inputTokens) || 0;
+  source.tokenUsage.cachedInputTokens = Number(source.tokenUsage.cachedInputTokens) || 0;
+  source.tokenUsage.daily = source.tokenUsage.daily && typeof source.tokenUsage.daily === 'object' ? source.tokenUsage.daily : {};
   return source;
 };
 
@@ -375,6 +380,46 @@ const recordModelCall = (source, success, latency, model) => {
   }
 };
 
+const usageTokenCounts = (usage, protocol = 'openai') => {
+  if (!usage || typeof usage !== 'object') return { inputTokens: 0, cachedInputTokens: 0 };
+  if (protocol === 'anthropic') {
+    const inputTokens = Number(usage.input_tokens) || 0;
+    const cacheRead = Number(usage.cache_read_input_tokens) || 0;
+    const cacheCreation = Number(usage.cache_creation_input_tokens) || 0;
+    return { inputTokens: inputTokens + cacheRead + cacheCreation, cachedInputTokens: cacheRead };
+  }
+  return {
+    inputTokens: Number(usage.prompt_tokens ?? usage.input_tokens) || 0,
+    cachedInputTokens: Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens) || 0,
+  };
+};
+const recordTokenUsage = (source, model, usage, protocol = 'openai') => {
+  const counts = usageTokenCounts(usage, protocol);
+  if (!counts.inputTokens && !counts.cachedInputTokens) return counts;
+  ensureSourceStats(source);
+  const target = source.modelStats[model] ||= emptyMetric();
+  for (const stats of [source.callStats, target]) {
+    stats.inputTokens += counts.inputTokens;
+    stats.cachedInputTokens += counts.cachedInputTokens;
+  }
+  const tokenUsage = source.tokenUsage;
+  tokenUsage.inputTokens += counts.inputTokens;
+  tokenUsage.cachedInputTokens += counts.cachedInputTokens;
+  const day = new Date().toISOString().slice(0, 10);
+  tokenUsage.daily[day] = {
+    inputTokens: Number(tokenUsage.daily[day]?.inputTokens) || 0,
+    cachedInputTokens: Number(tokenUsage.daily[day]?.cachedInputTokens) || 0,
+  };
+  tokenUsage.daily[day].inputTokens += counts.inputTokens;
+  tokenUsage.daily[day].cachedInputTokens += counts.cachedInputTokens;
+  const dailyKeys = Object.keys(tokenUsage.daily).sort();
+  for (const oldDay of dailyKeys.slice(0, Math.max(0, dailyKeys.length - 180))) delete tokenUsage.daily[oldDay];
+  return counts;
+};
+const parseUpstreamUsage = (text) => {
+  try { return JSON.parse(text)?.usage || null; } catch { return null; }
+};
+
 const recordModelProbe = (source, model, ok, latency, error = null) => {
   ensureSourceStats(source);
   const stats = source.modelStats[model] ||= emptyMetric();
@@ -389,7 +434,14 @@ const recordModelProbe = (source, model, ok, latency, error = null) => {
   stats.consecutiveFailures = ok ? 0 : stats.consecutiveFailures + 1;
 };
 
-const metricView = (stats) => ({ ...stats, averageLatency: stats.calls ? Math.round(stats.totalLatency / stats.calls) : 0, successRate: stats.calls ? Math.round((stats.successes / stats.calls) * 1000) / 10 : null, probeAverageLatency: stats.probeCalls ? Math.round(stats.probeTotalLatency / stats.probeCalls) : 0, probeSuccessRate: stats.probeCalls ? Math.round((stats.probeSuccesses / stats.probeCalls) * 1000) / 10 : null, reachableRate: stats.probeCalls ? Math.round((stats.probeSuccesses / stats.probeCalls) * 1000) / 10 : null, status: stats.lastProbeOk === true ? (stats.consecutiveFailures ? 'degraded' : 'available') : stats.lastProbeOk === false ? (stats.consecutiveFailures >= 5 ? 'unavailable' : 'degraded') : 'unknown' });
+const metricView = (stats) => ({ ...stats, inputTokens: Number(stats.inputTokens) || 0, cachedInputTokens: Number(stats.cachedInputTokens) || 0, averageLatency: stats.calls ? Math.round(stats.totalLatency / stats.calls) : 0, successRate: stats.calls ? Math.round((stats.successes / stats.calls) * 1000) / 10 : null, cacheHitRate: stats.inputTokens ? Math.round((stats.cachedInputTokens / stats.inputTokens) * 1000) / 10 : null, probeAverageLatency: stats.probeCalls ? Math.round(stats.probeTotalLatency / stats.probeCalls) : 0, probeSuccessRate: stats.probeCalls ? Math.round((stats.probeSuccesses / stats.probeCalls) * 1000) / 10 : null, reachableRate: stats.probeCalls ? Math.round((stats.probeSuccesses / stats.probeCalls) * 1000) / 10 : null, status: stats.lastProbeOk === true ? (stats.consecutiveFailures ? 'degraded' : 'available') : stats.lastProbeOk === false ? (stats.consecutiveFailures >= 5 ? 'unavailable' : 'degraded') : 'unknown' });
+const tokenUsageView = (source) => {
+  const usage = source.tokenUsage || { inputTokens: 0, cachedInputTokens: 0, daily: {} };
+  const inputTokens = Number(usage.inputTokens) || 0;
+  const cachedInputTokens = Number(usage.cachedInputTokens) || 0;
+  const daily = Object.entries(usage.daily || {}).sort(([a], [b]) => a.localeCompare(b)).slice(-31).map(([date, value]) => ({ date, inputTokens: Number(value?.inputTokens) || 0, cachedInputTokens: Number(value?.cachedInputTokens) || 0 }));
+  return { inputTokens, cachedInputTokens, cacheHitRate: inputTokens ? Math.round((cachedInputTokens / inputTokens) * 1000) / 10 : null, daily };
+};
 
 const publicSource = (source) => {
   ensureSourceStats(source);
@@ -402,6 +454,7 @@ const publicSource = (source) => {
     apiKey: source.apiKey && source.apiKey !== '未设置' ? `${source.apiKey.slice(0, 5)}••••${source.apiKey.slice(-4)}` : '未设置',
     callStats: metricView(source.callStats),
     modelStats: Object.fromEntries(Object.entries(source.modelStats).map(([model, stats]) => [model, metricView(stats)])),
+    tokenUsage: tokenUsageView(source),
     reachability: { ...source.reachability, successRate: source.reachability.checks ? Math.round((source.reachability.successes / source.reachability.checks) * 1000) / 10 : null },
   };
 };
@@ -479,6 +532,7 @@ const importConfig = async (payload = {}) => {
       callStats: item.callStats && typeof item.callStats === 'object' ? item.callStats : { calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null },
       reachability: item.reachability && typeof item.reachability === 'object' ? item.reachability : { checks: 0, successes: 0, lastChecked: null },
       modelStats: item.modelStats && typeof item.modelStats === 'object' ? item.modelStats : {},
+      tokenUsage: item.tokenUsage && typeof item.tokenUsage === 'object' ? item.tokenUsage : { inputTokens: 0, cachedInputTokens: 0, daily: {} },
       requests: Number(item.requests) || 0,
       spend: Number(item.spend) || 0,
     });
@@ -1015,7 +1069,7 @@ const handler = async (req, res) => {
   res.on('finish', () => {
     const shouldRecord = pathname.startsWith('/v1/') || pathname.startsWith('/api/sources') || res.statusCode >= 400;
     if (shouldRecord) writeRuntimeLog('request', { level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info', ...req.relayLog, status: res.statusCode, latencyMs: Date.now() - requestStarted });
-    if (res.statusCode < 400 && ['POST', 'PATCH', 'DELETE'].includes(req.method) && (/^\/api\/(?:sources|agents|settings|config\/import)/.test(pathname))) persistState();
+    if (res.statusCode < 400 && ['POST', 'PATCH', 'DELETE'].includes(req.method) && (/^\/api\/(?:sources|agents|settings|config\/import)/.test(pathname) || pathname.startsWith('/v1/'))) persistState();
   });
 
   if (pathname === '/api/auth/session' && req.method === 'GET') {
@@ -1177,6 +1231,7 @@ const handler = async (req, res) => {
       modelsUpdatedAt: null,
       callStats: { calls: 0, successes: 0, failures: 0, totalLatency: 0, lastLatency: 0, lastCalledAt: null },
       reachability: { checks: 0, successes: 0, lastChecked: null },
+      tokenUsage: { inputTokens: 0, cachedInputTokens: 0, daily: {} },
       requests: 0,
       spend: 0,
     };
@@ -1314,6 +1369,10 @@ const handler = async (req, res) => {
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstream = await fetchThroughSource(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, body: JSON.stringify({ ...body, model: candidateModel }), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         const text = await upstream.text();
+        const usage = parseUpstreamUsage(text);
+        const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, candidate.type === 'Anthropic' ? 'anthropic' : 'openai');
+        if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
+        if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
         if (upstream.ok || candidate === candidates.at(-1)) { res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json' }); return res.end(text); }
@@ -1369,7 +1428,13 @@ const handler = async (req, res) => {
           recordModelCall(candidate, true, Date.now() - started, candidateModel);
           candidate.requests += 1;
           res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-          try { return await streamOpenAIAsAnthropic(res, upstream, candidateModel, req.relayLog); } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
+          try {
+            return await streamOpenAIAsAnthropic(res, upstream, candidateModel, req.relayLog, (usage) => {
+              const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, 'openai');
+              if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
+              if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
+            });
+          } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
         }
         const text = await upstream.text();
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
@@ -1381,8 +1446,9 @@ const handler = async (req, res) => {
           }
           try {
             const normalizedResponse = normalizeOpenAIResponse(text, protocol, candidateModel);
-            if (normalizedResponse.usage?.cache_read_input_tokens) req.relayLog.cacheReadInputTokens = normalizedResponse.usage.cache_read_input_tokens;
-            if (normalizedResponse.usage?.cache_creation_input_tokens) req.relayLog.cacheCreationInputTokens = normalizedResponse.usage.cache_creation_input_tokens;
+            const tokenCounts = recordTokenUsage(candidate, candidateModel, parseUpstreamUsage(text), targetProtocol);
+            if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
+            if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
             if (body.stream && protocol === 'anthropic') {
               res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
               return writeAnthropicStream(res, normalizedResponse);
