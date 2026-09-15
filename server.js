@@ -35,6 +35,7 @@ const proxyAgents = new Map();
 const logQueues = new Map();
 const runtimeLogMemory = new Map();
 const cachePrefixMemory = new Map();
+const requestPrefixMemory = new Map();
 let statePersistQueue = Promise.resolve();
 let updateOperation = null;
 
@@ -952,7 +953,7 @@ const cachePrefixFingerprint = (body) => {
   };
 };
 
-const addCacheDiagnostics = (relayLog, source, model, agentId, protocol, body) => {
+const addCacheDiagnostics = (relayLog, source, model, agentId, protocol, body, originalBody = body) => {
   const fingerprint = cachePrefixFingerprint(body);
   const key = `${source.id}:${model}:${agentId || 'anonymous'}:${protocol}`;
   const previous = cachePrefixMemory.get(key);
@@ -961,6 +962,14 @@ const addCacheDiagnostics = (relayLog, source, model, agentId, protocol, body) =
   relayLog.cachePrefixBytes = fingerprint.bytes;
   relayLog.cachePrefixMessages = fingerprint.messageCount;
   if (previous) relayLog.cachePrefixChanged = previous !== fingerprint.hash;
+  const originalFingerprint = cachePrefixFingerprint(originalBody);
+  const originalKey = `${agentId || 'anonymous'}:${protocol}`;
+  const previousOriginal = requestPrefixMemory.get(originalKey);
+  requestPrefixMemory.set(originalKey, originalFingerprint.hash);
+  relayLog.requestPrefixHash = originalFingerprint.hash;
+  relayLog.requestPrefixBytes = originalFingerprint.bytes;
+  relayLog.requestPrefixMessages = originalFingerprint.messageCount;
+  if (previousOriginal) relayLog.requestPrefixChanged = previousOriginal !== originalFingerprint.hash;
 };
 
 const toOpenAIRequest = (body, protocol, model) => {
@@ -1443,7 +1452,7 @@ const handler = async (req, res) => {
       try {
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = { ...body, model: candidateModel };
-        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, 'openai', upstreamBody);
+        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, 'openai', upstreamBody, body);
         const upstream = await fetchThroughSource(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         const text = await upstream.text();
         const usage = parseUpstreamUsage(text);
@@ -1499,7 +1508,7 @@ const handler = async (req, res) => {
         const targetPath = targetProtocol === 'anthropic' ? (deepseekOfficial ? '/anthropic/v1/messages' : '/messages') : targetProtocol === 'responses' ? '/responses' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
-        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, targetProtocol, upstreamBody);
+        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, targetProtocol, upstreamBody, body);
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         req.relayLog.upstreamStatus = upstream.status;
         req.relayLog.upstreamContentType = upstream.headers.get('content-type') || '';
