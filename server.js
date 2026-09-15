@@ -855,7 +855,7 @@ const anthropicToolChoiceToOpenAI = (choice) => {
 
 const toOpenAIRequest = (body, protocol, model) => {
   if (protocol === 'responses') {
-    return { model, messages: inputToMessages(body.input), ...(body.instructions ? { messages: [{ role: 'system', content: body.instructions }, ...inputToMessages(body.input)] } : {}), ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}), ...(body.temperature !== undefined ? { temperature: body.temperature } : {}), ...(body.tools ? { tools: body.tools } : {}), ...(body.stream !== undefined ? { stream: body.stream } : {}) };
+    return { model, messages: inputToMessages(body.input), ...(body.instructions ? { messages: [{ role: 'system', content: body.instructions }, ...inputToMessages(body.input)] } : {}), ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}), ...(body.temperature !== undefined ? { temperature: body.temperature } : {}), ...(body.tools ? { tools: body.tools } : {}), ...(body.stream !== undefined ? { stream: body.stream } : {}), ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}) };
   }
   const system = body.system ? [{ role: 'system', content: body.system }] : [];
   const messages = [...system, ...anthropicMessagesToOpenAI(body.messages || [])];
@@ -869,6 +869,20 @@ const toOpenAIRequest = (body, protocol, model) => {
     ...(body.stop_sequences ? { stop: body.stop_sequences } : {}),
     ...(Array.isArray(body.tools) ? { tools: body.tools.map(anthropicToolToOpenAI) } : {}),
     ...(body.tool_choice ? { tool_choice: anthropicToolChoiceToOpenAI(body.tool_choice) } : {}),
+    ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}),
+  };
+};
+
+const openAIUsageToAnthropic = (usage = {}) => {
+  const promptTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  const cachedTokens = Number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? usage.cached_tokens ?? 0);
+  const cacheCreationTokens = Number(usage.prompt_tokens_details?.cache_creation_tokens ?? usage.input_tokens_details?.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? 0);
+  const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+  return {
+    input_tokens: Math.max(0, promptTokens - cachedTokens),
+    ...(cacheCreationTokens > 0 ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
+    ...(cachedTokens > 0 ? { cache_read_input_tokens: cachedTokens } : {}),
+    output_tokens: outputTokens,
   };
 };
 
@@ -885,7 +899,7 @@ const fromOpenAIResponse = (payload, protocol, model) => {
   if (!content.length) content.push({ type: 'text', text: '' });
   const stopReason = (choice?.message?.tool_calls?.length || 0) > 0 ? 'tool_use' : choice?.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
   if (protocol === 'responses') return { id: payload.id || `resp-${Date.now()}`, object: 'response', status: 'completed', model: payload.model || model, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }], output_text: text, usage: payload.usage };
-  return { id: payload.id || `msg-${Date.now()}`, type: 'message', role: 'assistant', model: payload.model || model, content, stop_reason: stopReason, usage: payload.usage ? { input_tokens: payload.usage.prompt_tokens, output_tokens: payload.usage.completion_tokens } : undefined };
+  return { id: payload.id || `msg-${Date.now()}`, type: 'message', role: 'assistant', model: payload.model || model, content, stop_reason: stopReason, usage: payload.usage ? openAIUsageToAnthropic(payload.usage) : undefined };
 };
 const normalizeOpenAIResponse = (text, protocol, model) => {
   if (!String(text || '').trim()) throw new Error('上游返回空响应');
@@ -914,7 +928,7 @@ const writeAnthropicStream = (res, message) => {
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
-const streamOpenAIAsAnthropic = async (res, upstream, model) => {
+const streamOpenAIAsAnthropic = async (res, upstream, model, relayLog = null) => {
   if (!upstream.body?.getReader) throw new Error('上游没有可读取的流响应');
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
@@ -956,7 +970,13 @@ const streamOpenAIAsAnthropic = async (res, upstream, model) => {
       if (argumentsDelta) writeEvent('content_block_delta', { type: 'content_block_delta', index: block.index, delta: { type: 'input_json_delta', partial_json: argumentsDelta } });
     }
     if (choice?.finish_reason) finishReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : choice.finish_reason === 'stop' ? 'end_turn' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn';
-    if (payload.usage) usage = { input_tokens: Number(payload.usage.prompt_tokens || payload.usage.input_tokens || 0), output_tokens: Number(payload.usage.completion_tokens || payload.usage.output_tokens || 0) };
+    if (payload.usage) {
+      usage = openAIUsageToAnthropic(payload.usage);
+      if (relayLog) {
+        if (usage.cache_read_input_tokens) relayLog.cacheReadInputTokens = usage.cache_read_input_tokens;
+        if (usage.cache_creation_input_tokens) relayLog.cacheCreationInputTokens = usage.cache_creation_input_tokens;
+      }
+    }
     if (payload.id) messageId = String(payload.id);
     return false;
   };
@@ -977,7 +997,7 @@ const streamOpenAIAsAnthropic = async (res, upstream, model) => {
   }
   if (textBlockStarted) writeEvent('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
   for (const block of toolBlocks.values()) writeEvent('content_block_stop', { type: 'content_block_stop', index: block.index });
-  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finishReason, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } });
+  writeEvent('message_delta', { type: 'message_delta', delta: { stop_reason: finishReason, stop_sequence: null }, usage: { output_tokens: usage.output_tokens, ...(usage.cache_read_input_tokens ? { cache_read_input_tokens: usage.cache_read_input_tokens } : {}), ...(usage.cache_creation_input_tokens ? { cache_creation_input_tokens: usage.cache_creation_input_tokens } : {}) } });
   writeEvent('message_stop', { type: 'message_stop' });
   res.end();
 };
@@ -1349,7 +1369,7 @@ const handler = async (req, res) => {
           recordModelCall(candidate, true, Date.now() - started, candidateModel);
           candidate.requests += 1;
           res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-          try { return await streamOpenAIAsAnthropic(res, upstream, candidateModel); } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
+          try { return await streamOpenAIAsAnthropic(res, upstream, candidateModel, req.relayLog); } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
         }
         const text = await upstream.text();
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
@@ -1361,6 +1381,8 @@ const handler = async (req, res) => {
           }
           try {
             const normalizedResponse = normalizeOpenAIResponse(text, protocol, candidateModel);
+            if (normalizedResponse.usage?.cache_read_input_tokens) req.relayLog.cacheReadInputTokens = normalizedResponse.usage.cache_read_input_tokens;
+            if (normalizedResponse.usage?.cache_creation_input_tokens) req.relayLog.cacheCreationInputTokens = normalizedResponse.usage.cache_creation_input_tokens;
             if (body.stream && protocol === 'anthropic') {
               res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
               return writeAnthropicStream(res, normalizedResponse);
