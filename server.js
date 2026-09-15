@@ -34,6 +34,7 @@ const defaultRequestTimeout = Math.min(600000, Math.max(10000, Number(process.en
 const proxyAgents = new Map();
 const logQueues = new Map();
 const runtimeLogMemory = new Map();
+const cachePrefixMemory = new Map();
 let statePersistQueue = Promise.resolve();
 let updateOperation = null;
 
@@ -932,6 +933,36 @@ const anthropicToolChoiceToOpenAI = (choice) => {
   return choice;
 };
 
+// Hash only the stable prompt prefix so cache behaviour can be diagnosed without
+// writing prompt contents or credentials to the runtime log.
+const cachePrefixFingerprint = (body) => {
+  const prefix = {
+    model: body?.model || '',
+    system: body?.system ?? null,
+    instructions: body?.instructions ?? null,
+    tools: body?.tools ?? null,
+    messages: Array.isArray(body?.messages) ? body.messages.slice(0, -1) : null,
+    input: Array.isArray(body?.input) ? body.input.slice(0, -1) : typeof body?.input === 'string' ? body.input : null,
+  };
+  const serialized = JSON.stringify(prefix);
+  return {
+    hash: createHash('sha256').update(serialized).digest('hex').slice(0, 16),
+    bytes: Buffer.byteLength(serialized),
+    messageCount: Array.isArray(body?.messages) ? Math.max(0, body.messages.length - 1) : Array.isArray(body?.input) ? Math.max(0, body.input.length - 1) : 0,
+  };
+};
+
+const addCacheDiagnostics = (relayLog, source, model, agentId, protocol, body) => {
+  const fingerprint = cachePrefixFingerprint(body);
+  const key = `${source.id}:${model}:${agentId || 'anonymous'}:${protocol}`;
+  const previous = cachePrefixMemory.get(key);
+  cachePrefixMemory.set(key, fingerprint.hash);
+  relayLog.cachePrefixHash = fingerprint.hash;
+  relayLog.cachePrefixBytes = fingerprint.bytes;
+  relayLog.cachePrefixMessages = fingerprint.messageCount;
+  if (previous) relayLog.cachePrefixChanged = previous !== fingerprint.hash;
+};
+
 const toOpenAIRequest = (body, protocol, model) => {
   if (protocol === 'responses') {
     return { model, messages: inputToMessages(body.input), ...(body.instructions ? { messages: [{ role: 'system', content: body.instructions }, ...inputToMessages(body.input)] } : {}), ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}), ...(body.temperature !== undefined ? { temperature: body.temperature } : {}), ...(body.tools ? { tools: body.tools } : {}), ...(body.stream !== undefined ? { stream: body.stream } : {}), ...(body.stream ? { stream_options: { ...(body.stream_options && typeof body.stream_options === 'object' ? body.stream_options : {}), include_usage: true } } : {}) };
@@ -1411,7 +1442,9 @@ const handler = async (req, res) => {
       const started = Date.now();
       try {
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
-        const upstream = await fetchThroughSource(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, body: JSON.stringify({ ...body, model: candidateModel }), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
+        const upstreamBody = { ...body, model: candidateModel };
+        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, 'openai', upstreamBody);
+        const upstream = await fetchThroughSource(`${candidate.baseUrl}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${candidate.apiKey}` }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         const text = await upstream.text();
         const usage = parseUpstreamUsage(text);
         const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, candidate.type === 'Anthropic' ? 'anthropic' : 'openai');
@@ -1466,6 +1499,7 @@ const handler = async (req, res) => {
         const targetPath = targetProtocol === 'anthropic' ? (deepseekOfficial ? '/anthropic/v1/messages' : '/messages') : targetProtocol === 'responses' ? '/responses' : '/chat/completions';
         const candidateModel = resolveUpstreamModel(candidate, body.model, agent);
         const upstreamBody = targetProtocol === 'openai' ? toOpenAIRequest(body, protocol, candidateModel) : { ...body, model: candidateModel };
+        addCacheDiagnostics(req.relayLog, candidate, candidateModel, agent.id, targetProtocol, upstreamBody);
         const upstream = await fetchThroughSource(`${candidate.baseUrl}${targetPath}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: body.stream ? 'text/event-stream' : 'application/json', Authorization: `Bearer ${candidate.apiKey}`, 'x-api-key': candidate.apiKey, 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' }, body: JSON.stringify(upstreamBody), signal: AbortSignal.timeout(state.settings.requestTimeout) }, candidate);
         req.relayLog.upstreamStatus = upstream.status;
         req.relayLog.upstreamContentType = upstream.headers.get('content-type') || '';
