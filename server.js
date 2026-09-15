@@ -417,7 +417,22 @@ const recordTokenUsage = (source, model, usage, protocol = 'openai') => {
   return counts;
 };
 const parseUpstreamUsage = (text) => {
-  try { return JSON.parse(text)?.usage || null; } catch { return null; }
+  try {
+    const payload = JSON.parse(text);
+    return payload?.usage || null;
+  } catch {
+    const usage = {};
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const data = line.trim().replace(/^data:\s*/, '');
+      if (!data || data === '[DONE]') continue;
+      try {
+        const payload = JSON.parse(data);
+        if (payload?.usage && typeof payload.usage === 'object') Object.assign(usage, payload.usage);
+        if (payload?.message?.usage && typeof payload.message.usage === 'object') Object.assign(usage, payload.message.usage);
+      } catch {}
+    }
+    return Object.keys(usage).length ? usage : null;
+  }
 };
 
 const recordModelProbe = (source, model, ok, latency, error = null) => {
@@ -1438,6 +1453,10 @@ const handler = async (req, res) => {
           } catch (error) { req.relayLog.error = safeLogText(error.message); if (!res.headersSent) return json(res, 502, { error: { message: error.message, type: 'upstream_error' }, relay: { source: candidate.name, protocol } }); res.end(); return; }
         }
         const text = await upstream.text();
+        const usage = parseUpstreamUsage(text);
+        const tokenCounts = recordTokenUsage(candidate, candidateModel, usage, targetProtocol);
+        if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
+        if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
         recordModelCall(candidate, upstream.ok, Date.now() - started, candidateModel);
         candidate.requests += 1;
         if (upstream.ok || candidate === candidates.at(-1)) {
@@ -1447,9 +1466,6 @@ const handler = async (req, res) => {
           }
           try {
             const normalizedResponse = normalizeOpenAIResponse(text, protocol, candidateModel);
-            const tokenCounts = recordTokenUsage(candidate, candidateModel, parseUpstreamUsage(text), targetProtocol);
-            if (tokenCounts.inputTokens) req.relayLog.inputTokens = tokenCounts.inputTokens;
-            if (tokenCounts.cachedInputTokens) req.relayLog.cachedInputTokens = tokenCounts.cachedInputTokens;
             if (body.stream && protocol === 'anthropic') {
               res.writeHead(upstream.status, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
               return writeAnthropicStream(res, normalizedResponse);
